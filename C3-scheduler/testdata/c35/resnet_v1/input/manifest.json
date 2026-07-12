@@ -1,0 +1,15 @@
+{
+  "tensors": [
+    {
+      "name": "input",
+      "file": "input.npy",
+      "dtype": "float32",
+      "shape": [
+        10000,
+        3,
+        32,
+        32
+      ]
+    }
+  ]
+}

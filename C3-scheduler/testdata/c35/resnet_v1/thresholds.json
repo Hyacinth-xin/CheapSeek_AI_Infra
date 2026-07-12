@@ -1,0 +1,10 @@
+{
+  "precision": {
+    "rtol": 0.001,
+    "atol": 0.001
+  },
+  "accuracy": {
+    "metric": "top1",
+    "min": 0.85
+  }
+}

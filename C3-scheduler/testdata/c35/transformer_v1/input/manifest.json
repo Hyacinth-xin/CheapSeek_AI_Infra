@@ -1,0 +1,13 @@
+{
+  "tensors": [
+    {
+      "name": "input_ids",
+      "file": "input_ids.npy",
+      "dtype": "int64",
+      "shape": [
+        10000,
+        18
+      ]
+    }
+  ]
+}

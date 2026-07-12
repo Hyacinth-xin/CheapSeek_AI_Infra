@@ -1,0 +1,7 @@
+{
+  "precision": {
+    "rtol": 0.001,
+    "atol": 0.001
+  },
+  "accuracy": null
+}
