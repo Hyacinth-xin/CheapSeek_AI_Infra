@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # Agentic4Systems暑期学校GPGPU智能体加速设计竞赛 2026
 
 > 面向本科生与研究生的综合性芯片设计竞赛
@@ -235,56 +234,6 @@
 - 第三方依赖必须如实披露
 - 大模型辅助开发允许，但必须能够解释和维护生成代码
 - 禁止硬编码、预计算、针对性优化和绕过评测
-
----
-
-## 仓库结构
-
-```text
-.
-|-- README.md                              # 本文件（竞赛总览）
-|-- LICENSE
-|-- Track-A/                                # 赛道 A：EDA 软件
-|   |-- README.md                          # A 赛道总览
-|   |-- A1-simulator/                      # A1：轻量 RTL 仿真器
-|   |   |-- spec.md                        # 赛题说明
-|   |   |-- scoring.md                     # 评分细则
-|   |   +-- testcases/                     # 公开测试
-|   |-- A2-verification/                   # A2：验证环境自动生成
-|   |   |-- spec.md
-|   |   |-- scoring.md
-|   |   +-- testcases/
-|   +-- A3-synthesis/                      # A3：逻辑综合工具
-|       |-- spec.md
-|       |-- scoring.md
-|       +-- testcases/                     # 公开电路 LSV01-LSV10
-|-- Track-B/                                # 赛道 B：GPGPU RTL 设计
-|   |-- README.md                          # B 赛道总览
-|   |-- spec.md                            # AEC ISA 完整规范
-|   |-- scoring.md                         # 评分细则
-|   |-- sram/                              # ASAP7 SRAM wrapper
-|   +-- testcases/                         # 公开参考测试
-+-- Track-C/                                # 赛道 C：编译器 & Runtime
-    |-- README.md                          # C 赛道总览
-    |-- C1-compiler/                       # C1：AEC IR 编译器
-    |   |-- spec.md
-    |   |-- scoring.md
-    |   +-- testcases/                     # PTX-01 ~ PTX-05
-    |-- C2-runtime/                        # C2：主机侧驱动
-    |   |-- spec.md
-    |   |-- scoring.md
-    |   +-- starter-kit/                   # 完整开发包
-    +-- C3-scheduler/                      # C3：算子调度
-        |-- spec.md
-        |-- scoring.md
-        +-- testcases/
-```
-
----
-
-## 联系方式
-
-如有任何关于赛题的疑问，请通过官方渠道联系组委会。
 
 许可证：MIT（见 [LICENSE](LICENSE)）
 =======
