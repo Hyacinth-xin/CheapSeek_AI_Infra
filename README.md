@@ -234,9 +234,3 @@
 - 第三方依赖必须如实披露
 - 大模型辅助开发允许，但必须能够解释和维护生成代码
 - 禁止硬编码、预计算、针对性优化和绕过评测
-
-许可证：MIT（见 [LICENSE](LICENSE)）
-=======
-# CheapSeek_AI_Infra
-A Hackathon Project, still developing.
->>>>>>> 6448560b037a6e46251fa59d4f6eff6ae7438b61
