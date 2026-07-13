@@ -27,3 +27,12 @@ class PrecisionProfile:
     precision: str
     supported_precisions: List[str] = field(default_factory=list)
     is_sensitive: bool = False
+
+
+@dataclass
+class KernelInstance:
+    kernel_name: str
+    input_names: List[str] = field(default_factory=list)
+    output_names: List[str] = field(default_factory=list)
+    params: KernelTuningParams = None
+    precision: str = "fp32"
