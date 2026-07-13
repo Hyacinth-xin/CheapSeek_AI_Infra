@@ -20,6 +20,7 @@ class KernelSpecRef:
     inputs: List[str] = field(default_factory=list)
     outputs: List[str] = field(default_factory=list)
     attrs: Dict = field(default_factory=dict)
+    tuning_params: Optional[KernelTuningParams] = None
 
 
 @dataclass

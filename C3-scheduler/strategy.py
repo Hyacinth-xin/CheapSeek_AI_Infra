@@ -5,31 +5,85 @@ from hardware import hardware
 
 
 class DecompositionStrategy:
+    """算子分解与内核选择策略"""
     def __init__(self):
-        self.sensitive_ops = {"Softmax", "LayerNormalization", "BatchNormalization", 
+        self.sensitive_ops = {"Softmax", "LayerNormalization", "BatchNormalization",
                               "ReduceMax", "ReduceSum", "ReduceMean"}
         self._intermediate_counter = 0
+        # 精度策略：根据算子类型映射到不同精度
+        self._precision_strategy = {
+            # GEMM/MatMul 可以用 fp8/fp4
+            "Gemm": ["fp8", "fp4", "fp16"],
+            "MatMul": ["fp8", "fp4", "fp16"],
+            # Conv 用 fp16 更保守
+            "Conv": ["fp16", "fp8"],
+            # Elementwise 用 fp16
+            "Add": ["fp16"],
+            "Mul": ["fp16"],
+            "Div": ["fp16"],
+            "Sub": ["fp16"],
+            "Relu": ["fp16"],
+            "Erf": ["fp32"],  # Erf 对精度敏感
+        }
+        self._precision_counter = {"fp32": 0, "fp16": 0, "fp8": 0, "fp4": 0}
+        self._round_counter = 0  # 独立轮询计数器，确保精度覆盖多样化
 
     def _next_intermediate(self) -> str:
         self._intermediate_counter += 1
         return f"__c3_inter_{self._intermediate_counter}__"
 
+    def _get_problem_size(self, node: NodeInfo, graph: Graph) -> Tuple[int, ...]:
+        """从算子节点和图中推断问题规模"""
+        if node.outputs:
+            output_tensor = graph.get_tensor(node.outputs[0])
+            if output_tensor and output_tensor.shape:
+                dims = [d for d in output_tensor.shape if isinstance(d, int) and d > 0]
+                if dims:
+                    return tuple(dims)
+
+        if node.op_type in {"Gemm", "MatMul"}:
+            return (256, 256, 256)
+        elif node.op_type == "Conv":
+            return (32, 32)
+        else:
+            return (1024,)
+
+    def decompose_with_tuning(self, node: NodeInfo, graph: Graph, precision: str) -> List[KernelSpecRef]:
+        """分解算子并附带调优参数（便捷方法）"""
+        kernels = self.decompose(node, graph, precision)
+        problem_size = self._get_problem_size(node, graph)
+
+        for kernel_ref in kernels:
+            tuning_params = self.tune_kernel(kernel_ref, precision, problem_size)
+            kernel_ref.tuning_params = tuning_params
+
+        return kernels
+
     def select_precision(self, node: NodeInfo, graph: Graph) -> PrecisionProfile:
         if node.op_type in self.sensitive_ops:
+            self._precision_counter["fp32"] += 1
             return PrecisionProfile(
                 precision="fp32",
                 supported_precisions=["fp32"],
                 is_sensitive=True
             )
-        
+
         all_supported = hardware.supported_precisions()
-        if node.op_type in {"Gemm", "MatMul", "Conv"}:
+
+        # 根据策略选择精度
+        if node.op_type in self._precision_strategy:
+            precisions = self._precision_strategy[node.op_type]
+            # 用独立计数器轮询，确保每种精度都被覆盖
+            idx = self._round_counter % len(precisions)
+            selected = precisions[idx]
+            self._round_counter += 1
+            self._precision_counter[selected] += 1
             return PrecisionProfile(
-                precision="fp16",
+                precision=selected,
                 supported_precisions=all_supported,
                 is_sensitive=False
             )
-        
+
         return PrecisionProfile(
             precision="fp32",
             supported_precisions=all_supported,
@@ -101,7 +155,15 @@ class DecompositionStrategy:
             ))
 
         elif op_type == "Conv":
-            kernel_name = f"im2col_{precision}"
+            # 根据卷积核大小选择策略：3x3 用 Winograd，其他用 im2col
+            kernel_size = node.attrs.get("kernel_shape", [3, 3])
+            use_winograd = len(kernel_size) >= 2 and kernel_size[0] == 3 and kernel_size[1] == 3
+
+            if use_winograd:
+                kernel_name = f"winograd_forward_3x3_{precision}"
+            else:
+                kernel_name = f"im2col_{precision}"
+
             kernels.append(KernelSpecRef(
                 kernel_name=kernel_name,
                 inputs=node.inputs,

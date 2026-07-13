@@ -5,18 +5,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from graph import import_onnx_graph
 from graph_passes import FusionPass
 
-print('=== 测试 fusion_test.onnx ===')
-g = import_onnx_graph('models/fusion_test.onnx')
-print('融合前节点数:', len(g.nodes))
-for node in g.nodes:
-    print('  ', node.name, ':', node.op_type)
+print('=== 测试 transformer_v1.onnx ===')
+g = import_onnx_graph('models/transformer_v1.onnx')
+original_count = len(g.nodes)
+print('融合前节点数:', original_count)
 
 fusion = FusionPass()
 g_fused = fusion.apply(g)
 
-print('\n融合后节点数:', len(g_fused.nodes))
-for node in g_fused.nodes:
-    print('  ', node.name, ':', node.op_type)
+fused_count = len(g_fused.nodes)
+print('融合后节点数:', fused_count)
+reduction_rate = (original_count - fused_count) / original_count * 100
+print('融合减少率: {:.1f}%'.format(reduction_rate))
 
 print('\n融合统计:')
 stats = fusion.get_stats()
