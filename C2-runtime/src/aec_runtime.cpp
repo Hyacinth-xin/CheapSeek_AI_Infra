@@ -602,6 +602,29 @@ aecError_t aecLaunch(aecKernelId kernel, aecDim3 grid, aecDim3 block,
         break;
     }
 
+    case AEC_KERNEL_AXPY_F32:
+        // AXPY canonical block = 28 bytes (struct has reserved → 32)
+        if (args_size != 28)
+            return finish(AEC_ERROR_INVALID_ARGUMENT);
+        semantic = static_cast<uint32_t>(kernel);  // 20
+        dtype    = AEC_DTYPE_FP32;
+        variant  = 0;
+        break;
+    case AEC_KERNEL_DOT_F32:
+        if (args_size != sizeof(aecDotArgs))
+            return finish(AEC_ERROR_INVALID_ARGUMENT);
+        semantic = static_cast<uint32_t>(kernel);  // 21
+        dtype    = AEC_DTYPE_FP32;
+        variant  = 0;
+        break;
+    case AEC_KERNEL_NRM2_F32:
+        if (args_size != sizeof(aecNrm2Args))
+            return finish(AEC_ERROR_INVALID_ARGUMENT);
+        semantic = static_cast<uint32_t>(kernel);  // 22
+        dtype    = AEC_DTYPE_FP32;
+        variant  = 0;
+        break;
+
     default:
         return unsupported();
     }
@@ -620,6 +643,28 @@ aecError_t aecLaunch(aecKernelId kernel, aecDim3 grid, aecDim3 block,
         write_u64_le(params,  8, va->b);
         write_u64_le(params, 16, va->c);
         write_u64_le(params, 24, va->count);
+    } else if (kernel == AEC_KERNEL_AXPY_F32) {
+        // Canonical: X:u64 Y:u64 count:u64 alpha:f32bits = 28 bytes
+        const auto *aa = static_cast<const aecAxpyArgs *>(args);
+        write_u64_le(params,  0, aa->x);
+        write_u64_le(params,  8, aa->y);
+        write_u64_le(params, 16, aa->count);
+        uint32_t alpha_bits;
+        std::memcpy(&alpha_bits, &aa->alpha, sizeof(alpha_bits));
+        write_u32_le(params, 24, alpha_bits);
+    } else if (kernel == AEC_KERNEL_DOT_F32) {
+        // Canonical: X:u64 Y:u64 result:u64 count:u64 = 32 bytes
+        const auto *da = static_cast<const aecDotArgs *>(args);
+        write_u64_le(params,  0, da->x);
+        write_u64_le(params,  8, da->y);
+        write_u64_le(params, 16, da->result);
+        write_u64_le(params, 24, da->count);
+    } else if (kernel == AEC_KERNEL_NRM2_F32) {
+        // Canonical: X:u64 result:u64 count:u64 = 24 bytes
+        const auto *na = static_cast<const aecNrm2Args *>(args);
+        write_u64_le(params,  0, na->x);
+        write_u64_le(params,  8, na->result);
+        write_u64_le(params, 16, na->count);
     } else {
         const auto *ga = static_cast<const aecGemmArgs *>(args);
         write_u64_le(params,  0, ga->a);
@@ -697,20 +742,36 @@ aecError_t aecMatmulI32(aecDevicePtr a, aecDevicePtr b, aecDevicePtr c,
 // =====================================================================
 // R202 / R203  Other GEMM dtypes (stubs)
 // =====================================================================
-aecError_t aecMatmulF4(aecDevicePtr, aecDevicePtr, aecDevicePtr,
-                       uint32_t, uint32_t, uint32_t, aecStream_t) { return unsupported(); }
-aecError_t aecMatmulF8(aecDevicePtr, aecDevicePtr, aecDevicePtr,
-                       uint32_t, uint32_t, uint32_t, aecFp8Format, aecStream_t) { return unsupported(); }
-aecError_t aecMatmulF16(aecDevicePtr, aecDevicePtr, aecDevicePtr,
-                        uint32_t, uint32_t, uint32_t, aecStream_t) { return unsupported(); }
-aecError_t aecMatmulBF16(aecDevicePtr, aecDevicePtr, aecDevicePtr,
-                         uint32_t, uint32_t, uint32_t, aecStream_t) { return unsupported(); }
-aecError_t aecMatmulF64(aecDevicePtr, aecDevicePtr, aecDevicePtr,
-                        uint32_t, uint32_t, uint32_t, aecStream_t) { return unsupported(); }
-aecError_t aecMatmulI4(aecDevicePtr, aecDevicePtr, aecDevicePtr,
-                       uint32_t, uint32_t, uint32_t, aecStream_t) { return unsupported(); }
-aecError_t aecMatmulI8(aecDevicePtr, aecDevicePtr, aecDevicePtr,
-                       uint32_t, uint32_t, uint32_t, aecStream_t) { return unsupported(); }
+aecError_t aecMatmulF4(aecDevicePtr a, aecDevicePtr b, aecDevicePtr c,
+                       uint32_t m, uint32_t n, uint32_t k, aecStream_t s) {
+    return gemm_launch(a, b, c, m, n, k, AEC_DTYPE_FP4_E2M1, s);
+}
+aecError_t aecMatmulF8(aecDevicePtr a, aecDevicePtr b, aecDevicePtr c,
+                       uint32_t m, uint32_t n, uint32_t k,
+                       aecFp8Format fmt, aecStream_t s) {
+    aecDataType dt = (fmt == AEC_FP8_E5M2) ? AEC_DTYPE_FP8_E5M2 : AEC_DTYPE_FP8_E4M3;
+    return gemm_launch(a, b, c, m, n, k, dt, s);
+}
+aecError_t aecMatmulF16(aecDevicePtr a, aecDevicePtr b, aecDevicePtr c,
+                        uint32_t m, uint32_t n, uint32_t k, aecStream_t s) {
+    return gemm_launch(a, b, c, m, n, k, AEC_DTYPE_FP16, s);
+}
+aecError_t aecMatmulBF16(aecDevicePtr a, aecDevicePtr b, aecDevicePtr c,
+                         uint32_t m, uint32_t n, uint32_t k, aecStream_t s) {
+    return gemm_launch(a, b, c, m, n, k, AEC_DTYPE_BF16, s);
+}
+aecError_t aecMatmulF64(aecDevicePtr a, aecDevicePtr b, aecDevicePtr c,
+                        uint32_t m, uint32_t n, uint32_t k, aecStream_t s) {
+    return gemm_launch(a, b, c, m, n, k, AEC_DTYPE_FP64, s);
+}
+aecError_t aecMatmulI4(aecDevicePtr a, aecDevicePtr b, aecDevicePtr c,
+                       uint32_t m, uint32_t n, uint32_t k, aecStream_t s) {
+    return gemm_launch(a, b, c, m, n, k, AEC_DTYPE_INT4, s);
+}
+aecError_t aecMatmulI8(aecDevicePtr a, aecDevicePtr b, aecDevicePtr c,
+                       uint32_t m, uint32_t n, uint32_t k, aecStream_t s) {
+    return gemm_launch(a, b, c, m, n, k, AEC_DTYPE_INT8, s);
+}
 
 // =====================================================================
 // R204+  (stubs)
@@ -731,8 +792,35 @@ aecError_t aecResetRuntimeStats(void) {
     return aecDeviceResetStats() == AEC_DEVICE_SUCCESS ? AEC_SUCCESS : finish(AEC_ERROR_DEVICE);
 }
 
-aecError_t aecAxpy(aecDevicePtr, aecDevicePtr, uint64_t, float, aecStream_t) { return unsupported(); }
-aecError_t aecDot(aecDevicePtr, aecDevicePtr, aecDevicePtr, uint64_t, aecStream_t) { return unsupported(); }
-aecError_t aecNrm2(aecDevicePtr, aecDevicePtr, uint64_t, aecStream_t) { return unsupported(); }
+aecError_t aecAxpy(aecDevicePtr x, aecDevicePtr y, uint64_t count,
+                   float alpha, aecStream_t s) {
+    if (count < 1 || count > 1048576) return finish(AEC_ERROR_INVALID_ARGUMENT);
+    aecAxpyArgs args = {x, y, count, alpha, 0};
+    uint32_t bx = (count < 1024) ? static_cast<uint32_t>(count) : 1024u;
+    uint32_t gx = static_cast<uint32_t>((count + bx - 1) / bx);
+    aecDim3 grid  = {gx, 1, 1};
+    aecDim3 block = {bx, 1, 1};
+    return aecLaunch(AEC_KERNEL_AXPY_F32, grid, block, &args, 28, s);
+}
+aecError_t aecDot(aecDevicePtr x, aecDevicePtr y, aecDevicePtr result,
+                 uint64_t count, aecStream_t s) {
+    if (count < 1 || count > 1048576) return finish(AEC_ERROR_INVALID_ARGUMENT);
+    aecDotArgs args = {x, y, result, count};
+    uint32_t bx = (count < 1024) ? static_cast<uint32_t>(count) : 1024u;
+    uint32_t gx = static_cast<uint32_t>((count + bx - 1) / bx);
+    aecDim3 grid  = {gx, 1, 1};
+    aecDim3 block = {bx, 1, 1};
+    return aecLaunch(AEC_KERNEL_DOT_F32, grid, block, &args, sizeof(args), s);
+}
+aecError_t aecNrm2(aecDevicePtr x, aecDevicePtr result, uint64_t count,
+                   aecStream_t s) {
+    if (count < 1 || count > 1048576) return finish(AEC_ERROR_INVALID_ARGUMENT);
+    aecNrm2Args args = {x, result, count};
+    uint32_t bx = (count < 1024) ? static_cast<uint32_t>(count) : 1024u;
+    uint32_t gx = static_cast<uint32_t>((count + bx - 1) / bx);
+    aecDim3 grid  = {gx, 1, 1};
+    aecDim3 block = {bx, 1, 1};
+    return aecLaunch(AEC_KERNEL_NRM2_F32, grid, block, &args, sizeof(args), s);
+}
 
 } // extern "C"
