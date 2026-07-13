@@ -1,6 +1,7 @@
 #include "aec_runtime.h"
 #include "aec_device_abi.h"
 
+#include <cmath>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -221,6 +222,7 @@ aecError_t sync_dma(uint16_t opcode, aecDevicePtr dev_ptr,
     if (host_ptr == 0 || bytes == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
     if (!span_inside_one_alloc(dev_ptr, bytes))
         return finish(AEC_ERROR_INVALID_ADDRESS);
+    process_all_streams();
 
     aecDeviceCommand cmd{};
     cmd.abi_version = AEC_DEVICE_ABI_VERSION;
@@ -869,22 +871,72 @@ aecError_t aecAxpy(aecDevicePtr x, aecDevicePtr y, uint64_t count,
 aecError_t aecDot(aecDevicePtr x, aecDevicePtr y, aecDevicePtr result,
                  uint64_t count, aecStream_t s) {
     if (count < 1 || count > 1048576) return finish(AEC_ERROR_INVALID_ARGUMENT);
-    aecDotArgs args = {x, y, result, count};
-    uint32_t bx = (count < 1024) ? static_cast<uint32_t>(count) : 1024u;
-    uint32_t gx = static_cast<uint32_t>((count + bx - 1) / bx);
-    aecDim3 grid  = {gx, 1, 1};
-    aecDim3 block = {bx, 1, 1};
-    return aecLaunch(AEC_KERNEL_DOT_F32, grid, block, &args, sizeof(args), s);
+    constexpr uint64_t MAX_CHUNK = 65536;
+    if (count <= MAX_CHUNK) {
+        aecDotArgs args = {x, y, result, count};
+        uint32_t bx = (count < 256) ? static_cast<uint32_t>(count) : 256u;
+        uint32_t gx = static_cast<uint32_t>((count + bx - 1) / bx);
+        aecDim3 grid  = {gx, 1, 1};
+        aecDim3 block = {bx, 1, 1};
+        return aecLaunch(AEC_KERNEL_DOT_F32, grid, block, &args, sizeof(args), s);
+    }
+    // Large count: kernel has ~90K element limit; split into chunks
+    float total = 0.0f;
+    aecDevicePtr partial_buf;
+    aecError_t rc = aecAlloc(&partial_buf, sizeof(float));
+    if (rc != AEC_SUCCESS) return finish(rc);
+    for (uint64_t off = 0; off < count; off += MAX_CHUNK) {
+        uint64_t chunk = std::min(MAX_CHUNK, count - off);
+        aecDotArgs args = {x + off * sizeof(float), y + off * sizeof(float),
+                           partial_buf, chunk};
+        uint32_t bx2 = (chunk < 256) ? static_cast<uint32_t>(chunk) : 256u;
+        uint32_t gx2 = static_cast<uint32_t>((chunk + bx2 - 1) / bx2);
+        aecDim3 grid2  = {gx2, 1, 1};
+        aecDim3 block2 = {bx2, 1, 1};
+        rc = aecLaunch(AEC_KERNEL_DOT_F32, grid2, block2, &args, sizeof(args), nullptr);
+        if (rc != AEC_SUCCESS) { aecFree(partial_buf); return finish(rc); }
+        float partial;
+        rc = aecCopyD2H(&partial, partial_buf, sizeof(float));
+        if (rc != AEC_SUCCESS) { aecFree(partial_buf); return finish(rc); }
+        total += partial;
+    }
+    aecFree(partial_buf);
+    return aecCopyH2D(result, &total, sizeof(float));
 }
 aecError_t aecNrm2(aecDevicePtr x, aecDevicePtr result, uint64_t count,
                    aecStream_t s) {
     if (count < 1 || count > 1048576) return finish(AEC_ERROR_INVALID_ARGUMENT);
-    aecNrm2Args args = {x, result, count};
-    uint32_t bx = (count < 1024) ? static_cast<uint32_t>(count) : 1024u;
-    uint32_t gx = static_cast<uint32_t>((count + bx - 1) / bx);
-    aecDim3 grid  = {gx, 1, 1};
-    aecDim3 block = {bx, 1, 1};
-    return aecLaunch(AEC_KERNEL_NRM2_F32, grid, block, &args, sizeof(args), s);
+    constexpr uint64_t MAX_CHUNK = 65536;
+    if (count <= MAX_CHUNK) {
+        aecNrm2Args args = {x, result, count};
+        uint32_t bx = (count < 256) ? static_cast<uint32_t>(count) : 256u;
+        uint32_t gx = static_cast<uint32_t>((count + bx - 1) / bx);
+        aecDim3 grid  = {gx, 1, 1};
+        aecDim3 block = {bx, 1, 1};
+        return aecLaunch(AEC_KERNEL_NRM2_F32, grid, block, &args, sizeof(args), s);
+    }
+    // Large count: kernel has ~90K element limit; split into chunks
+    double sum_sq = 0.0;
+    aecDevicePtr partial_buf;
+    aecError_t rc = aecAlloc(&partial_buf, sizeof(float));
+    if (rc != AEC_SUCCESS) return finish(rc);
+    for (uint64_t off = 0; off < count; off += MAX_CHUNK) {
+        uint64_t chunk = std::min(MAX_CHUNK, count - off);
+        aecNrm2Args args = {x + off * sizeof(float), partial_buf, chunk};
+        uint32_t bx2 = (chunk < 256) ? static_cast<uint32_t>(chunk) : 256u;
+        uint32_t gx2 = static_cast<uint32_t>((chunk + bx2 - 1) / bx2);
+        aecDim3 grid2  = {gx2, 1, 1};
+        aecDim3 block2 = {bx2, 1, 1};
+        rc = aecLaunch(AEC_KERNEL_NRM2_F32, grid2, block2, &args, sizeof(args), nullptr);
+        if (rc != AEC_SUCCESS) { aecFree(partial_buf); return finish(rc); }
+        float partial;
+        rc = aecCopyD2H(&partial, partial_buf, sizeof(float));
+        if (rc != AEC_SUCCESS) { aecFree(partial_buf); return finish(rc); }
+        sum_sq += static_cast<double>(partial) * static_cast<double>(partial);
+    }
+    aecFree(partial_buf);
+    float result_val = static_cast<float>(std::sqrt(sum_sq));
+    return aecCopyH2D(result, &result_val, sizeof(float));
 }
 
 } // extern "C"
