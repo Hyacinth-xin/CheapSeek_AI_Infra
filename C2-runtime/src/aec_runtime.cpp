@@ -24,7 +24,7 @@ aecError_t unsupported() {
 }
 
 // =====================================================================
-// Device status → Runtime error conversion
+// Device status → Runtime error
 // =====================================================================
 aecError_t device_status_to_error(aecDeviceStatus status) {
     switch (status) {
@@ -54,7 +54,7 @@ std::unordered_map<aecDevicePtr, AllocInfo> live_allocs;
 bool span_inside_one_alloc(aecDevicePtr ptr, size_t bytes) {
     if (ptr == 0 || bytes == 0) return false;
     uint64_t end = ptr + bytes;
-    if (end < ptr) return false;   // overflow
+    if (end < ptr) return false;
 
     std::lock_guard<std::mutex> lock(alloc_mutex);
     for (const auto &kv : live_allocs) {
@@ -68,22 +68,18 @@ bool span_inside_one_alloc(aecDevicePtr ptr, size_t bytes) {
 // Sequence counter (R103+)
 // =====================================================================
 std::mutex seq_mutex;
-uint64_t   next_sequence = 1;   // non-zero, strictly increasing
+uint64_t   next_sequence = 1;
 
 // =====================================================================
 // Synchronous DMA helper (R103)
 // =====================================================================
 aecError_t sync_dma(uint16_t opcode, aecDevicePtr dev_ptr,
                     uint64_t host_ptr, size_t bytes) {
-    // --- parameter checks ---
     if (host_ptr == 0)    return finish(AEC_ERROR_INVALID_ARGUMENT);
     if (bytes == 0)       return finish(AEC_ERROR_INVALID_ARGUMENT);
-
-    // --- bounds check: device span must be fully inside one live alloc ---
     if (!span_inside_one_alloc(dev_ptr, bytes))
         return finish(AEC_ERROR_INVALID_ADDRESS);
 
-    // --- build command ---
     aecDeviceCommand cmd{};
     cmd.abi_version = AEC_DEVICE_ABI_VERSION;
     cmd.opcode      = opcode;
@@ -94,31 +90,43 @@ aecError_t sync_dma(uint16_t opcode, aecDevicePtr dev_ptr,
         cmd.sequence = next_sequence++;
     }
 
-    cmd.stream_id = 0;               // null stream → synchronous
-    cmd.bytes     = bytes;
-    cmd.chunk_bytes = static_cast<uint32_t>(bytes);  // one chunk
+    cmd.stream_id   = 0;
+    cmd.bytes       = bytes;
+    cmd.chunk_bytes = static_cast<uint32_t>(bytes);
     cmd.queue_depth = 1;
     cmd.channel     = 0;
 
     if (opcode == AEC_DEVICE_OP_H2D) {
         cmd.host_address = host_ptr;
         cmd.dst          = dev_ptr;
-    } else {  // D2H
+    } else {
         cmd.src          = dev_ptr;
         cmd.host_address = host_ptr;
     }
 
-    // --- submit & wait for completion ---
     aecDeviceCompletion comp{};
-    aecDeviceStatus status = aecDeviceSubmit(&cmd, &comp);
-    if (status != AEC_DEVICE_SUCCESS)
-        return finish(device_status_to_error(status));
-
+    aecDeviceStatus st = aecDeviceSubmit(&cmd, &comp);
+    if (st != AEC_DEVICE_SUCCESS)
+        return finish(device_status_to_error(st));
     if (comp.status != AEC_DEVICE_SUCCESS)
         return finish(device_status_to_error(
                          static_cast<aecDeviceStatus>(comp.status)));
 
     return AEC_SUCCESS;
+}
+
+// =====================================================================
+// Little-endian u64 writer for canonical parameter blocks (R104+)
+// =====================================================================
+void write_u64_le(uint8_t *buf, size_t off, uint64_t v) {
+    buf[off + 0] = static_cast<uint8_t>(v);
+    buf[off + 1] = static_cast<uint8_t>(v >> 8);
+    buf[off + 2] = static_cast<uint8_t>(v >> 16);
+    buf[off + 3] = static_cast<uint8_t>(v >> 24);
+    buf[off + 4] = static_cast<uint8_t>(v >> 32);
+    buf[off + 5] = static_cast<uint8_t>(v >> 40);
+    buf[off + 6] = static_cast<uint8_t>(v >> 48);
+    buf[off + 7] = static_cast<uint8_t>(v >> 56);
 }
 
 } // namespace
@@ -185,9 +193,9 @@ aecError_t aecAlloc(aecDevicePtr *out_ptr, size_t bytes) {
     if (out_ptr == nullptr) return finish(AEC_ERROR_INVALID_ARGUMENT);
 
     aecDevicePtr ptr = 0;
-    aecDeviceStatus status = aecDeviceAlloc(bytes, 64, &ptr);
-    if (status != AEC_DEVICE_SUCCESS)
-        return finish(device_status_to_error(status));
+    aecDeviceStatus st = aecDeviceAlloc(bytes, 64, &ptr);
+    if (st != AEC_DEVICE_SUCCESS)
+        return finish(device_status_to_error(st));
 
     {
         std::lock_guard<std::mutex> lock(alloc_mutex);
@@ -209,17 +217,17 @@ aecError_t aecFree(aecDevicePtr ptr) {
             for (const auto &kv : live_allocs) {
                 const AllocInfo &a = kv.second;
                 if (ptr > a.base && ptr < a.base + a.size)
-                    return finish(AEC_ERROR_INVALID_ADDRESS); // interior
+                    return finish(AEC_ERROR_INVALID_ADDRESS);
             }
-            return finish(AEC_ERROR_INVALID_ADDRESS); // stale / double-free
+            return finish(AEC_ERROR_INVALID_ADDRESS);
         }
 
         live_allocs.erase(it);
     }
 
-    aecDeviceStatus status = aecDeviceFree(ptr);
-    if (status != AEC_DEVICE_SUCCESS)
-        return finish(device_status_to_error(status));
+    aecDeviceStatus st = aecDeviceFree(ptr);
+    if (st != AEC_DEVICE_SUCCESS)
+        return finish(device_status_to_error(st));
 
     return AEC_SUCCESS;
 }
@@ -239,7 +247,82 @@ aecError_t aecCopyD2H(void *dst, aecDevicePtr src, size_t bytes) {
 }
 
 // =====================================================================
-// R104+  (stubs)
+// R104  Kernel Launch
+// =====================================================================
+
+aecError_t aecLaunch(aecKernelId kernel, aecDim3 grid, aecDim3 block,
+                     const void *args, size_t args_size, aecStream_t stream) {
+    // --- grid / block validation ---
+    if (grid.x == 0 || grid.y == 0 || grid.z == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
+    if (block.x == 0 || block.y == 0 || block.z == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
+    uint64_t block_vol = static_cast<uint64_t>(block.x) * block.y * block.z;
+    if (block_vol > 1024) return finish(AEC_ERROR_INVALID_ARGUMENT);
+    if (args == nullptr || args_size == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
+
+    // --- streams not implemented yet; only null stream (synchronous) ---
+    if (stream != nullptr) return unsupported();
+
+    // --- map kernel ID → (semantic_id, dtype, variant) ---
+    uint32_t semantic, dtype, variant;
+
+    switch (kernel) {
+    case AEC_KERNEL_VECTOR_ADD_F32:
+        if (args_size != sizeof(aecVectorAddArgs))
+            return finish(AEC_ERROR_INVALID_ARGUMENT);
+        semantic = static_cast<uint32_t>(kernel); dtype = AEC_DTYPE_FP32; variant = 0;
+        break;
+    default:
+        return unsupported();
+    }
+
+    // --- resolve kernel image ---
+    aecDeviceKernelInfo kinfo{};
+    aecDeviceStatus st = aecDeviceResolveKernel(semantic, dtype, variant, &kinfo);
+    if (st != AEC_DEVICE_SUCCESS)
+        return finish(device_status_to_error(st));
+
+    // --- build canonical parameter block (little-endian, tightly packed) ---
+    uint8_t params[AEC_DEVICE_MAX_PARAM_BYTES] = {};  // unused bytes = 0
+    const auto *va = static_cast<const aecVectorAddArgs *>(args);
+    write_u64_le(params,  0, va->a);
+    write_u64_le(params,  8, va->b);
+    write_u64_le(params, 16, va->c);
+    write_u64_le(params, 24, va->count);
+
+    // --- build ISA_LAUNCH command ---
+    aecDeviceCommand cmd{};
+    cmd.abi_version     = AEC_DEVICE_ABI_VERSION;
+    cmd.opcode          = AEC_DEVICE_OP_ISA_LAUNCH;
+    cmd.flags           = AEC_DEVICE_FLAG_NONE;
+
+    {
+        std::lock_guard<std::mutex> lock(seq_mutex);
+        cmd.sequence = next_sequence++;
+    }
+
+    cmd.stream_id       = 0;
+    cmd.kernel_handle   = kinfo.handle;
+    cmd.isa_version     = kinfo.isa_version;
+    cmd.entry_pc        = kinfo.entry_pc;
+    cmd.grid            = aecDeviceDim3{grid.x, grid.y, grid.z};
+    cmd.block           = aecDeviceDim3{block.x, block.y, block.z};
+    cmd.parameter_bytes = static_cast<uint32_t>(args_size);
+    std::memcpy(cmd.parameters, params, args_size);
+
+    // --- submit & wait for completion ---
+    aecDeviceCompletion comp{};
+    st = aecDeviceSubmit(&cmd, &comp);
+    if (st != AEC_DEVICE_SUCCESS)
+        return finish(device_status_to_error(st));
+    if (comp.status != AEC_DEVICE_SUCCESS)
+        return finish(device_status_to_error(
+                         static_cast<aecDeviceStatus>(comp.status)));
+
+    return AEC_SUCCESS;
+}
+
+// =====================================================================
+// R105+  (stubs)
 // =====================================================================
 
 aecError_t aecCopyAsync(aecDevicePtr, void *, size_t, aecCopyDirection, aecStream_t) { return unsupported(); }
@@ -270,7 +353,6 @@ aecError_t aecResetRuntimeStats(void) {
                                                         : finish(AEC_ERROR_DEVICE);
 }
 
-aecError_t aecLaunch(aecKernelId, aecDim3, aecDim3, const void *, size_t, aecStream_t) { return unsupported(); }
 aecError_t aecMatmulF4(aecDevicePtr, aecDevicePtr, aecDevicePtr, uint32_t, uint32_t, uint32_t, aecStream_t) { return unsupported(); }
 aecError_t aecMatmulF8(aecDevicePtr, aecDevicePtr, aecDevicePtr, uint32_t, uint32_t, uint32_t, aecFp8Format, aecStream_t) { return unsupported(); }
 aecError_t aecMatmulF16(aecDevicePtr, aecDevicePtr, aecDevicePtr, uint32_t, uint32_t, uint32_t, aecStream_t) { return unsupported(); }
