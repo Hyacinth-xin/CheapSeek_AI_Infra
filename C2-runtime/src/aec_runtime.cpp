@@ -222,6 +222,7 @@ aecError_t sync_dma(uint16_t opcode, aecDevicePtr dev_ptr,
     if (host_ptr == 0 || bytes == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
     if (!span_inside_one_alloc(dev_ptr, bytes))
         return finish(AEC_ERROR_INVALID_ADDRESS);
+    process_all_streams();
 
     aecDeviceCommand cmd{};
     cmd.abi_version = AEC_DEVICE_ABI_VERSION;
