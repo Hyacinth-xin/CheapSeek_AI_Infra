@@ -11,11 +11,50 @@ class FusionPass:
         self.fusion_log = []
         self.fused_count = 0
 
+        # 记录原始输出张量
+        original_outputs = set(graph.outputs)
+        original_inputs = set(graph.inputs)
+
         graph = self._fuse_matmul_bias(graph)
         graph = self._fuse_conv_bn(graph)
         graph = self._fuse_ew_chain(graph)
         graph = self._fuse_softmax_dropout(graph)
         graph = self._fuse_residual_norm(graph)
+
+        # 更新 outputs：确保原始输出张量仍然存在
+        # 检查哪些原始输出被融合了，更新为融合后的输出
+        updated_outputs = []
+        for orig_out in original_outputs:
+            found = False
+            for node in graph.nodes:
+                if orig_out in node.outputs:
+                    updated_outputs.append(orig_out)
+                    found = True
+                    break
+            if not found:
+                # 输出被融合了，使用融合节点的输出
+                for node in graph.nodes:
+                    if node.outputs:
+                        updated_outputs.append(node.outputs[0])
+                        break
+        graph.outputs = list(set(updated_outputs)) if updated_outputs else []
+
+        # 更新 inputs：确保原始输入张量仍然存在
+        updated_inputs = []
+        for orig_in in original_inputs:
+            found = False
+            for node in graph.nodes:
+                if orig_in in node.inputs:
+                    updated_inputs.append(orig_in)
+                    found = True
+                    break
+            if not found:
+                # 输入被使用但可能在某个融合节点中
+                updated_inputs.append(orig_in)
+        graph.inputs = list(set(updated_inputs)) if updated_inputs else []
+
+        # 更新 node_map
+        graph.node_map = {n.name: n for n in graph.nodes}
 
         return graph
 
