@@ -109,7 +109,3 @@ output/
 
 # Claude AI 上下文文件（个人使用）
 CLAUDE.md
-
-# 测试用的压力脚本
-# C2 测试脚本
-C2-runtime/test/
