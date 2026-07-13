@@ -650,6 +650,22 @@ def local_cse(program: PTXProgram) -> int:
                 and not inst.mnemonic.startswith("setp.")
             )
             if cse_eligible:
+                # Non-SSA safety: a self-updating instruction like
+                #   sub.u32 %r1, %r1, %r2
+                # cannot be reused because its result depends on the *old*
+                # value of the destination register.
+                defs, _ = instruction_defs_uses(inst)
+                uses_dest = False
+                for operand in inst.operands[1:]:
+                    token = operand.strip()
+                    if token.startswith("[") and token.endswith("]"):
+                        token = token[1:-1].strip()
+                    if token == dest:
+                        uses_dest = True
+                        break
+                if uses_dest:
+                    cse_eligible = False
+            if cse_eligible:
                 key = (inst.mnemonic, *inst.operands[1:])
                 holder = expressions.get(key)
                 if holder and holder != dest:
@@ -687,6 +703,7 @@ def fuse_mad(program: PTXProgram) -> int:
                     and len(add.operands) == 3
                     and all_uses.get(mul.operands[0], 0) == 1
                     and mul.operands[0] in add.operands[1:]
+                    and sum(1 for op in add.operands[1:] if op == mul.operands[0]) == 1
                 ):
                     other = add.operands[2] if add.operands[1] == mul.operands[0] else add.operands[1]
                     out.append(PTXInstruction("mad.f32", [add.operands[0], mul.operands[1], mul.operands[2], other], add.line))
