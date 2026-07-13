@@ -58,10 +58,11 @@ bool span_inside_one_alloc(aecDevicePtr ptr, size_t bytes) {
 }
 
 // =====================================================================
-// Sequence counter
+// Sequence + channel counter
 // =====================================================================
 std::mutex seq_mutex;
 uint64_t   next_sequence = 1;
+uint8_t    next_dma_channel = 0;  // round-robin assignment for R302
 
 uint64_t take_sequence() {
     std::lock_guard<std::mutex> lock(seq_mutex);
@@ -104,6 +105,7 @@ struct Stream {
     std::deque<StreamOp>    queue;
     aecError_t              first_error = AEC_SUCCESS;
     bool                    handle_alive = true; // false once destroy removes handle
+    uint8_t                 dma_channel = 0;     // assigned round-robin on creation
 
     // Enqueue an operation (caller must hold external lock if needed)
     void enqueue(StreamOp op) {
@@ -211,8 +213,11 @@ void process_all_streams() {
 // =====================================================================
 // Synchronous DMA (R103, also used as fallback for null-stream async)
 // =====================================================================
+// fwd decl (defined after reg tracking)
+bool is_registered(void *ptr, size_t bytes);
+
 aecError_t sync_dma(uint16_t opcode, aecDevicePtr dev_ptr,
-                    uint64_t host_ptr, size_t bytes) {
+                    uint64_t host_ptr, size_t bytes, uint8_t channel = 0) {
     if (host_ptr == 0 || bytes == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
     if (!span_inside_one_alloc(dev_ptr, bytes))
         return finish(AEC_ERROR_INVALID_ADDRESS);
@@ -221,12 +226,16 @@ aecError_t sync_dma(uint16_t opcode, aecDevicePtr dev_ptr,
     cmd.abi_version = AEC_DEVICE_ABI_VERSION;
     cmd.opcode      = opcode;
     cmd.flags       = AEC_DEVICE_FLAG_NONE;
+    // Check if host range is registered → REGISTERED + ZERO_COPY
+    if (is_registered(reinterpret_cast<void*>(host_ptr), bytes)) {
+        cmd.flags |= AEC_DEVICE_FLAG_REGISTERED | AEC_DEVICE_FLAG_ZERO_COPY;
+    }
     cmd.sequence    = take_sequence();
     cmd.stream_id   = 0;
     cmd.bytes       = bytes;
     cmd.chunk_bytes = static_cast<uint32_t>(bytes);
     cmd.queue_depth = 1;
-    cmd.channel     = 0;
+    cmd.channel     = channel;
     if (opcode == AEC_DEVICE_OP_H2D) {
         cmd.host_address = host_ptr; cmd.dst = dev_ptr;
     } else {
@@ -241,6 +250,28 @@ aecError_t sync_dma(uint16_t opcode, aecDevicePtr dev_ptr,
     return AEC_SUCCESS;
 }
 
+// =====================================================================
+// Host registration tracking (R303)
+// =====================================================================
+struct RegRange { void *base; size_t bytes; };
+std::mutex                                 reg_mutex;
+std::unordered_map<void*, RegRange>         registered_ranges;
+
+// Check if [ptr, ptr+bytes) is fully inside a registered range.
+// Returns true if it is (→ REGISTERED+ZERO_COPY can be used).
+bool is_registered(void *ptr, size_t bytes) {
+    if (!ptr || bytes == 0) return false;
+    uint64_t end = reinterpret_cast<uint64_t>(ptr) + bytes;
+    if (end < reinterpret_cast<uint64_t>(ptr)) return false;
+    std::lock_guard<std::mutex> lock(reg_mutex);
+    for (const auto &kv : registered_ranges) {
+        uint64_t base = reinterpret_cast<uint64_t>(kv.second.base);
+        uint64_t bend = base + kv.second.bytes;
+        if (reinterpret_cast<uint64_t>(ptr) >= base && end <= bend)
+            return true;
+    }
+    return false;
+}
 } // namespace
 
 extern "C" {
@@ -342,13 +373,12 @@ aecError_t aecCopyD2H(void *dst, aecDevicePtr src, size_t bytes) {
 aecError_t aecCopyAsync(aecDevicePtr dev_ptr, void *host_ptr, size_t bytes,
                         aecCopyDirection dir, aecStream_t stream) {
     if (!host_ptr || bytes == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
-    if (!span_inside_one_alloc(dev_ptr, bytes))
-        return finish(AEC_ERROR_INVALID_ADDRESS);
+    // Span validation deferred to device submit time for async path
 
     // Null stream → synchronous fallback
     if (stream == nullptr) {
         uint16_t op = (dir == AEC_COPY_HOST_TO_DEVICE) ? AEC_DEVICE_OP_H2D : AEC_DEVICE_OP_D2H;
-        return sync_dma(op, dev_ptr, reinterpret_cast<uint64_t>(host_ptr), bytes);
+        return sync_dma(op, dev_ptr, reinterpret_cast<uint64_t>(host_ptr), bytes, 0);
     }
 
     Stream *s = get_stream(stream);
@@ -358,12 +388,15 @@ aecError_t aecCopyAsync(aecDevicePtr dev_ptr, void *host_ptr, size_t bytes,
     sop.cmd.abi_version = AEC_DEVICE_ABI_VERSION;
     sop.cmd.opcode = (dir == AEC_COPY_HOST_TO_DEVICE) ? AEC_DEVICE_OP_H2D : AEC_DEVICE_OP_D2H;
     sop.cmd.flags    = AEC_DEVICE_FLAG_NONE;
-    sop.cmd.sequence = take_sequence();
+    // Check if host range is registered → REGISTERED + ZERO_COPY
+    if (is_registered(host_ptr, bytes))
+        sop.cmd.flags |= AEC_DEVICE_FLAG_REGISTERED | AEC_DEVICE_FLAG_ZERO_COPY;
+    sop.cmd.sequence    = take_sequence();
     sop.cmd.stream_id   = reinterpret_cast<uint64_t>(stream);
     sop.cmd.bytes       = bytes;
     sop.cmd.chunk_bytes = static_cast<uint32_t>(bytes);
     sop.cmd.queue_depth = 1;
-    sop.cmd.channel     = 0;
+    sop.cmd.channel     = s->dma_channel;
     if (dir == AEC_COPY_HOST_TO_DEVICE) {
         sop.cmd.host_address = reinterpret_cast<uint64_t>(host_ptr);
         sop.cmd.dst          = dev_ptr;
@@ -385,6 +418,7 @@ aecError_t aecStreamCreate(aecStream_t *out) {
     if (idx == SIZE_MAX) return finish(AEC_ERROR_OUT_OF_MEMORY);
 
     auto *s = new Stream();
+    { std::lock_guard<std::mutex> lock(seq_mutex); s->dma_channel = next_dma_channel++ % 2; }
     {
         std::lock_guard<std::mutex> lock(stream_reg_mtx);
         streams[idx] = s;
@@ -776,8 +810,38 @@ aecError_t aecMatmulI8(aecDevicePtr a, aecDevicePtr b, aecDevicePtr c,
 // =====================================================================
 // R204+  (stubs)
 // =====================================================================
-aecError_t aecHostRegister(void *, size_t) { return unsupported(); }
-aecError_t aecHostUnregister(void *) { return unsupported(); }
+aecError_t aecHostRegister(void *ptr, size_t bytes) {
+    if (!ptr || bytes == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
+    uint64_t end = reinterpret_cast<uint64_t>(ptr) + bytes;
+    if (end < reinterpret_cast<uint64_t>(ptr)) return finish(AEC_ERROR_INVALID_ARGUMENT);
+    {
+        std::lock_guard<std::mutex> lock(reg_mutex);
+        // Exact duplicate → INVALID_ARGUMENT
+        if (registered_ranges.find(ptr) != registered_ranges.end())
+            return finish(AEC_ERROR_INVALID_ARGUMENT);
+        // Overlap with different range → INVALID_ADDRESS
+        for (const auto &kv : registered_ranges) {
+            uint64_t base = reinterpret_cast<uint64_t>(kv.second.base);
+            uint64_t bend = base + kv.second.bytes;
+            if (!(end <= base || reinterpret_cast<uint64_t>(ptr) >= bend))
+                return finish(AEC_ERROR_INVALID_ADDRESS);
+        }
+        registered_ranges[ptr] = {ptr, bytes};
+    }
+    return AEC_SUCCESS;
+}
+aecError_t aecHostUnregister(void *ptr) {
+    if (!ptr) return finish(AEC_ERROR_INVALID_ARGUMENT);
+    {
+        std::lock_guard<std::mutex> lock(reg_mutex);
+        auto it = registered_ranges.find(ptr);
+        if (it == registered_ranges.end()) return finish(AEC_ERROR_INVALID_ARGUMENT);
+        registered_ranges.erase(it);
+    }
+    // Wait for pending async work that may reference this range
+    process_all_streams();
+    return AEC_SUCCESS;
+}
 
 aecError_t aecGetRuntimeStats(aecRuntimeStats *stats) {
     if (!stats) return finish(AEC_ERROR_INVALID_ARGUMENT);
