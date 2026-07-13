@@ -2,9 +2,14 @@
 #include "aec_device_abi.h"
 
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 namespace {
 
+// =====================================================================
+// TLS last error (R101)
+// =====================================================================
 thread_local aecError_t last_error = AEC_SUCCESS;
 
 aecError_t finish(aecError_t error) {
@@ -18,9 +23,111 @@ aecError_t unsupported() {
     return finish(AEC_ERROR_NOT_SUPPORTED);
 }
 
+// =====================================================================
+// Device status → Runtime error conversion
+// =====================================================================
+aecError_t device_status_to_error(aecDeviceStatus status) {
+    switch (status) {
+    case AEC_DEVICE_SUCCESS:           return AEC_SUCCESS;
+    case AEC_DEVICE_INVALID_ARGUMENT:  return AEC_ERROR_INVALID_ARGUMENT;
+    case AEC_DEVICE_OUT_OF_MEMORY:     return AEC_ERROR_OUT_OF_MEMORY;
+    case AEC_DEVICE_INVALID_ADDRESS:   return AEC_ERROR_INVALID_ADDRESS;
+    case AEC_DEVICE_UNSUPPORTED:       return AEC_ERROR_NOT_SUPPORTED;
+    case AEC_DEVICE_INJECTED_FAULT:    return AEC_ERROR_DEVICE;
+    case AEC_DEVICE_ISA_TRAP:          return AEC_ERROR_ISA_TRAP;
+    case AEC_DEVICE_INTERNAL:
+    default:                           return AEC_ERROR_INTERNAL;
+    }
+}
+
+// =====================================================================
+// Allocation tracking (R102)
+// =====================================================================
+struct AllocInfo {
+    aecDevicePtr base;
+    size_t      size;
+};
+
+std::mutex                                alloc_mutex;
+std::unordered_map<aecDevicePtr, AllocInfo> live_allocs;
+
+bool span_inside_one_alloc(aecDevicePtr ptr, size_t bytes) {
+    if (ptr == 0 || bytes == 0) return false;
+    uint64_t end = ptr + bytes;
+    if (end < ptr) return false;   // overflow
+
+    std::lock_guard<std::mutex> lock(alloc_mutex);
+    for (const auto &kv : live_allocs) {
+        const AllocInfo &a = kv.second;
+        if (ptr >= a.base && end <= a.base + a.size) return true;
+    }
+    return false;
+}
+
+// =====================================================================
+// Sequence counter (R103+)
+// =====================================================================
+std::mutex seq_mutex;
+uint64_t   next_sequence = 1;   // non-zero, strictly increasing
+
+// =====================================================================
+// Synchronous DMA helper (R103)
+// =====================================================================
+aecError_t sync_dma(uint16_t opcode, aecDevicePtr dev_ptr,
+                    uint64_t host_ptr, size_t bytes) {
+    // --- parameter checks ---
+    if (host_ptr == 0)    return finish(AEC_ERROR_INVALID_ARGUMENT);
+    if (bytes == 0)       return finish(AEC_ERROR_INVALID_ARGUMENT);
+
+    // --- bounds check: device span must be fully inside one live alloc ---
+    if (!span_inside_one_alloc(dev_ptr, bytes))
+        return finish(AEC_ERROR_INVALID_ADDRESS);
+
+    // --- build command ---
+    aecDeviceCommand cmd{};
+    cmd.abi_version = AEC_DEVICE_ABI_VERSION;
+    cmd.opcode      = opcode;
+    cmd.flags       = AEC_DEVICE_FLAG_NONE;
+
+    {
+        std::lock_guard<std::mutex> lock(seq_mutex);
+        cmd.sequence = next_sequence++;
+    }
+
+    cmd.stream_id = 0;               // null stream → synchronous
+    cmd.bytes     = bytes;
+    cmd.chunk_bytes = static_cast<uint32_t>(bytes);  // one chunk
+    cmd.queue_depth = 1;
+    cmd.channel     = 0;
+
+    if (opcode == AEC_DEVICE_OP_H2D) {
+        cmd.host_address = host_ptr;
+        cmd.dst          = dev_ptr;
+    } else {  // D2H
+        cmd.src          = dev_ptr;
+        cmd.host_address = host_ptr;
+    }
+
+    // --- submit & wait for completion ---
+    aecDeviceCompletion comp{};
+    aecDeviceStatus status = aecDeviceSubmit(&cmd, &comp);
+    if (status != AEC_DEVICE_SUCCESS)
+        return finish(device_status_to_error(status));
+
+    if (comp.status != AEC_DEVICE_SUCCESS)
+        return finish(device_status_to_error(
+                         static_cast<aecDeviceStatus>(comp.status)));
+
+    return AEC_SUCCESS;
+}
+
 } // namespace
 
 extern "C" {
+
+// =====================================================================
+// R101  Device / Error
+// =====================================================================
 
 aecError_t aecDeviceCount(int *count) {
     if (count == nullptr) return finish(AEC_ERROR_INVALID_ARGUMENT);
@@ -70,13 +177,71 @@ const char *aecGetErrorName(aecError_t error) {
     }
 }
 
-aecError_t aecAlloc(aecDevicePtr *out_ptr, size_t) {
+// =====================================================================
+// R102  Allocation / Free
+// =====================================================================
+
+aecError_t aecAlloc(aecDevicePtr *out_ptr, size_t bytes) {
     if (out_ptr == nullptr) return finish(AEC_ERROR_INVALID_ARGUMENT);
-    return unsupported();
+
+    aecDevicePtr ptr = 0;
+    aecDeviceStatus status = aecDeviceAlloc(bytes, 64, &ptr);
+    if (status != AEC_DEVICE_SUCCESS)
+        return finish(device_status_to_error(status));
+
+    {
+        std::lock_guard<std::mutex> lock(alloc_mutex);
+        live_allocs[ptr] = {ptr, bytes};
+    }
+
+    *out_ptr = ptr;
+    return AEC_SUCCESS;
 }
-aecError_t aecFree(aecDevicePtr) { return unsupported(); }
-aecError_t aecCopyH2D(aecDevicePtr, const void *, size_t) { return unsupported(); }
-aecError_t aecCopyD2H(void *, aecDevicePtr, size_t) { return unsupported(); }
+
+aecError_t aecFree(aecDevicePtr ptr) {
+    if (ptr == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
+
+    {
+        std::lock_guard<std::mutex> lock(alloc_mutex);
+
+        auto it = live_allocs.find(ptr);
+        if (it == live_allocs.end()) {
+            for (const auto &kv : live_allocs) {
+                const AllocInfo &a = kv.second;
+                if (ptr > a.base && ptr < a.base + a.size)
+                    return finish(AEC_ERROR_INVALID_ADDRESS); // interior
+            }
+            return finish(AEC_ERROR_INVALID_ADDRESS); // stale / double-free
+        }
+
+        live_allocs.erase(it);
+    }
+
+    aecDeviceStatus status = aecDeviceFree(ptr);
+    if (status != AEC_DEVICE_SUCCESS)
+        return finish(device_status_to_error(status));
+
+    return AEC_SUCCESS;
+}
+
+// =====================================================================
+// R103  Synchronous Copy
+// =====================================================================
+
+aecError_t aecCopyH2D(aecDevicePtr dst, const void *src, size_t bytes) {
+    return sync_dma(AEC_DEVICE_OP_H2D, dst,
+                    reinterpret_cast<uint64_t>(src), bytes);
+}
+
+aecError_t aecCopyD2H(void *dst, aecDevicePtr src, size_t bytes) {
+    return sync_dma(AEC_DEVICE_OP_D2H, src,
+                    reinterpret_cast<uint64_t>(dst), bytes);
+}
+
+// =====================================================================
+// R104+  (stubs)
+// =====================================================================
+
 aecError_t aecCopyAsync(aecDevicePtr, void *, size_t, aecCopyDirection, aecStream_t) { return unsupported(); }
 aecError_t aecStreamCreate(aecStream_t *) { return unsupported(); }
 aecError_t aecStreamDestroy(aecStream_t) { return unsupported(); }
