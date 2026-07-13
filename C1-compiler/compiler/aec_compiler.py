@@ -558,21 +558,15 @@ def merge_blocks(program: PTXProgram) -> int:
             if pred_counts.get(succ_name, 0) != 1:
                 break
 
-            if block.instructions and block.instructions[-1].mnemonic == "ret":
+            # Never merge when the block ends with an explicit terminator.
+            # Deleting a bra and replacing it with fall-through is unsafe
+            # because the bra target may not be the physically adjacent block.
+            if not block.instructions or block.instructions[-1].mnemonic in {"bra", "ret"}:
                 break
 
             succ_block = next((b for b in program.blocks if b.name == succ_name), None)
             if succ_block is None or succ_block.name in skip:
                 break
-
-            # Drop a redundant unconditional branch whose target is the
-            # block we are about to absorb.
-            if (
-                block.instructions
-                and block.instructions[-1].mnemonic == "bra"
-                and not block.instructions[-1].guard
-            ):
-                block.instructions.pop()
 
             block.instructions.extend(succ_block.instructions)
             block.successors = list(succ_block.successors)
