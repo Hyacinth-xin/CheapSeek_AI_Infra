@@ -205,7 +205,10 @@ class ONNXExecutor:
         return result
 
     # ------------------------------------------------------------------
-    # Conv: im2col + matmul（numpy/cupy 通用，比逐通道卷积快 50-100x）
+    # Conv: im2col + matmul（numpy/cupy 通用）
+    #
+    # 从 padded 输入直接展开为 3D col 矩阵，避免 5D 中间张量。
+    # 内存峰值 = N * C_in * KH * KW * out_h * out_w（与 3D col 相同）。
     # ------------------------------------------------------------------
     def _conv(self, inputs, node):
         x, w = inputs[0], inputs[1]
@@ -230,12 +233,13 @@ class ONNXExecutor:
         if len(stride) == 1:
             stride = [stride[0], stride[0]]
 
-        pad_top, pad_left, pad_bottom, pad_right = padding
+        N, C_in, H_in, W_in = x.shape
+        C_out, C_in_g, KH, KW = w.shape
         stride_h, stride_w = stride
         dilation_h, dilation_w = dilation
 
-        N, C_in, H_in, W_in = x.shape
-        C_out, C_in_g, KH, KW = w.shape
+        pad_top, pad_left = padding[0], padding[1]
+        pad_bottom, pad_right = padding[2], padding[3]
 
         H_pad = H_in + pad_top + pad_bottom
         W_pad = W_in + pad_left + pad_right
@@ -249,31 +253,37 @@ class ONNXExecutor:
         else:
             x_padded = x
 
-        # im2col: (N, C_in, KH, KW, out_h, out_w)
-        col = xp.empty((N, C_in, KH, KW, out_h, out_w), dtype=x.dtype)
+        # 直接 im2col 到 3D：(N, C_in*KH*KW, out_h*out_w)
+        K = C_in * KH * KW
+        P = out_h * out_w
+        col = xp.empty((N, K, P), dtype=x.dtype)
+
+        # 按 (KH, KW) 双循环展开（每次复制大块，减少 kernel launch 开销）
         for i in range(KH):
-            i_max = i + stride_h * out_h
+            i_s = i * dilation_h
+            i_slice = slice(i_s, i_s + stride_h * out_h, stride_h)
             for j in range(KW):
-                j_max = j + stride_w * out_w
-                col[:, :, i, j, :, :] = x_padded[:, :,
-                                                  i:i_max:stride_h,
-                                                  j:j_max:stride_w]
+                j_s = j * dilation_w
+                j_slice = slice(j_s, j_s + stride_w * out_w, stride_w)
+                # (N, C_in, out_h, out_w) → 放置到 C_in 个列位置
+                for c in range(C_in):
+                    k_idx = c * KH * KW + i * KW + j
+                    col[:, k_idx, :] = x_padded[:, c, i_slice, j_slice].reshape(N, P)
+
+        w_mat = w.reshape(C_out, K // groups if groups > 1 else K)
 
         if groups == 1:
-            col = col.reshape(N, C_in * KH * KW, out_h * out_w)
-            w_mat = w.reshape(C_out, C_in * KH * KW)
-            out = xp.matmul(w_mat, col)  # (N, C_out, out_h*out_w)
-            out = out.reshape(N, C_out, out_h, out_w)
+            out = xp.matmul(w_mat, col).reshape(N, C_out, out_h, out_w)
         else:
-            out = xp.empty((N, C_out, out_h, out_w), dtype=x.dtype)
             C_out_g = C_out // groups
+            C_in_per_g = C_in // groups
+            K_g = C_in_per_g * KH * KW
+            out = xp.empty((N, C_out, out_h, out_w), dtype=x.dtype)
             for g in range(groups):
-                col_g = col[:, g * C_in_g:(g + 1) * C_in_g].reshape(
-                    N, C_in_g * KH * KW, out_h * out_w)
-                w_g = w[g * C_out_g:(g + 1) * C_out_g].reshape(
-                    C_out_g, C_in_g * KH * KW)
-                out_g = xp.matmul(w_g, col_g).reshape(N, C_out_g, out_h, out_w)
-                out[:, g * C_out_g:(g + 1) * C_out_g] = out_g
+                col_g = col[:, g * K_g:(g + 1) * K_g, :]
+                w_g = w_mat[g * C_out_g:(g + 1) * C_out_g, :]
+                out[:, g * C_out_g:(g + 1) * C_out_g, :, :] = \
+                    xp.matmul(w_g, col_g).reshape(N, C_out_g, out_h, out_w)
 
         if b is not None:
             out = out + b.reshape(1, -1, 1, 1)
@@ -314,6 +324,7 @@ class ONNXExecutor:
         """分批推理，返回拼接好的 host numpy dict（不写盘）。
 
         batch_size=None 表示全量。显存不足时用 batch_size=256 分批。
+        batch 结果先在 GPU 累积，最后一次性 concat+as_host，减少 D2H 次数。
         """
         if self.model is None:
             self._parse_model()
@@ -328,6 +339,7 @@ class ONNXExecutor:
             outputs = self._run_graph(inputs)
             return {name: as_host(arr) for name, arr in outputs.items()}
 
+        # 在 GPU 上累积 batch 结果，最后一次性 as_host
         all_outputs = None
         for start in range(0, total, batch_size):
             end = min(start + batch_size, total)
@@ -336,9 +348,11 @@ class ONNXExecutor:
             if all_outputs is None:
                 all_outputs = {name: [] for name in outputs}
             for name, arr in outputs.items():
-                all_outputs[name].append(as_host(arr))
+                # 保留 device array，延后 as_host
+                all_outputs[name].append(arr)
 
-        return {name: np.concatenate(arrs, axis=0).astype(np.float32)
+        # 最后一次 GPU concat，然后统一 as_host
+        return {name: as_host(xp.concatenate(arrs, axis=0).astype(xp.float32))
                 for name, arrs in all_outputs.items()}
 
     def run(self, input_dir, output_dir):
