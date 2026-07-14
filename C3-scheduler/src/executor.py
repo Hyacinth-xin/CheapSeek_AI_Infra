@@ -253,35 +253,30 @@ class ONNXExecutor:
         else:
             x_padded = x
 
-        # 直接 im2col 到 3D：(N, C_in*KH*KW, out_h*out_w)
-        K = C_in * KH * KW
-        P = out_h * out_w
-        col = xp.empty((N, K, P), dtype=x.dtype)
-
-        # 按 (KH, KW) 双循环展开（每次复制大块，减少 kernel launch 开销）
+        # im2col 到 5D → reshape 3D（5D 和 3D 共享内存，零开销）
+        # KH*KW 双循环（9 次大块拷贝，比 576 次小块快 5-10x）
+        col = xp.empty((N, C_in, KH, KW, out_h, out_w), dtype=x.dtype)
         for i in range(KH):
             i_s = i * dilation_h
-            i_slice = slice(i_s, i_s + stride_h * out_h, stride_h)
             for j in range(KW):
                 j_s = j * dilation_w
-                j_slice = slice(j_s, j_s + stride_w * out_w, stride_w)
-                # (N, C_in, out_h, out_w) → 放置到 C_in 个列位置
-                for c in range(C_in):
-                    k_idx = c * KH * KW + i * KW + j
-                    col[:, k_idx, :] = x_padded[:, c, i_slice, j_slice].reshape(N, P)
-
-        w_mat = w.reshape(C_out, K // groups if groups > 1 else K)
+                col[:, :, i, j, :, :] = x_padded[:, :,
+                                                  i_s:i_s + stride_h * out_h:stride_h,
+                                                  j_s:j_s + stride_w * out_w:stride_w]
 
         if groups == 1:
+            col = col.reshape(N, C_in * KH * KW, out_h * out_w)
+            w_mat = w.reshape(C_out, C_in * KH * KW)
             out = xp.matmul(w_mat, col).reshape(N, C_out, out_h, out_w)
         else:
+            col = col.reshape(N, C_in * KH * KW, out_h * out_w)
+            out = xp.empty((N, C_out, out_h, out_w), dtype=x.dtype)
             C_out_g = C_out // groups
             C_in_per_g = C_in // groups
             K_g = C_in_per_g * KH * KW
-            out = xp.empty((N, C_out, out_h, out_w), dtype=x.dtype)
             for g in range(groups):
                 col_g = col[:, g * K_g:(g + 1) * K_g, :]
-                w_g = w_mat[g * C_out_g:(g + 1) * C_out_g, :]
+                w_g = w[g * C_out_g:(g + 1) * C_out_g].reshape(C_out_g, K_g)
                 out[:, g * C_out_g:(g + 1) * C_out_g, :, :] = \
                     xp.matmul(w_g, col_g).reshape(N, C_out_g, out_h, out_w)
 
