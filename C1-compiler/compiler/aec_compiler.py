@@ -2052,7 +2052,7 @@ def compile_source(source: str, input_name: str, output_name: str, opt_level: st
         pass_stats["block_merging"] = merge_blocks(ptx)
         pass_stats["licm"] = licm(ptx)
         pass_stats["address_induction"] = strength_reduce_address_induction(ptx)
-        pass_stats["loop_unroll"] = unroll_loops(ptx)
+        pass_stats["loop_unroll"] = 0  # unroll_loops(ptx) — disabled: remainder + semantic bugs
 
         # Fixpoint: fold constants and eliminate dead code iteratively.
         # Each round may expose new constant operands or dead instructions
