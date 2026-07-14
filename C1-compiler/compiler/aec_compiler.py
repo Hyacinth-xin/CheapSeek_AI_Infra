@@ -1383,6 +1383,13 @@ def mir_peephole(program: MIRProgram) -> int:
             if inst.dest:
                 # Kill last_def for this dest (new definition invalidates old copy)
                 last_def.pop(inst.dest, None)
+                # Also kill any last_def entries whose *source* is this dest:
+                # if %r2 was a copy of %r1 and %r1 is now redefined, %r2's
+                # cached source is stale.
+                last_def = {
+                    k: v for k, v in last_def.items()
+                    if v[0] != inst.dest
+                }
                 # Kill any imm_regs backed by the redefined register
                 imm_regs = {k: v for k, v in imm_regs.items() if v != inst.dest}
                 # Track CPY definitions for copy propagation
@@ -1482,6 +1489,11 @@ def allocate_registers(program: MIRProgram) -> Tuple[Dict[str, int], Dict[str, i
             continue  # one side was already merged or is unused
         # Don't coalesce across pair components
         if src in _pair_components or dst in _pair_components:
+            continue
+        # Must not coalesce if src and dst interfere with each other.
+        # Merging interfering nodes would give them the same colour and
+        # clobber a value that is still live.
+        if src in graph.get(dst, set()) or dst in graph.get(src, set()):
             continue
         # Briggs test: merged node degree must be < 256 (trivially colorable)
         merged_neighbors = (graph[src] | graph[dst]) - {src, dst}
