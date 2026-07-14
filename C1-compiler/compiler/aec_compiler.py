@@ -1260,6 +1260,145 @@ def mir_dce(program: MIRProgram) -> int:
     return removed
 
 
+def mir_peephole(program: MIRProgram) -> int:
+    """Local peephole optimisations on the lowered MIR.
+
+    Operates within each basic block.  Returns the total number of
+    instructions eliminated or simplified.
+    """
+    removed = 0
+
+    for block in program.blocks:
+        # Track which virtual register currently holds each LOADI value.
+        # key = (value, typ), value = register name
+        imm_regs: Dict[Tuple[int, str], str] = {}
+        # Track the most recent definition of each register for copy-propagation.
+        # key = dest_register, value = (src_register, instruction_index_in_new_list)
+        last_def: Dict[str, Tuple[str, int]] = {}
+        new_insts: List[MIRInstruction] = []
+
+        for _idx, inst in enumerate(block.instructions):
+            # ── substitute through known copy chains ──
+            if isinstance(inst.src1, str) and inst.src1 in last_def:
+                src, def_idx = last_def[inst.src1]
+                # Only substitute if the source register hasn't been redefined
+                # since the copy was recorded (we rebuild last_def as we go).
+                if def_idx == next(
+                    (i for r, (_, i) in reversed(list(last_def.items()))
+                     if r == inst.src1), def_idx
+                ):
+                    inst.src1 = src
+            if isinstance(inst.src2, str) and inst.src2 in last_def:
+                src, def_idx = last_def[inst.src2]
+                if def_idx == next(
+                    (i for r, (_, i) in reversed(list(last_def.items()))
+                     if r == inst.src2), def_idx
+                ):
+                    inst.src2 = src
+            if isinstance(inst.src3, str) and inst.src3 in last_def:
+                src, def_idx = last_def[inst.src3]
+                if def_idx == next(
+                    (i for r, (_, i) in reversed(list(last_def.items()))
+                     if r == inst.src3), def_idx
+                ):
+                    inst.src3 = src
+
+            # ── Pattern 1: LOADI dedup ──
+            if inst.op == "LOADI" and inst.dest and inst.imm is not None:
+                key = (inst.imm & 0xFFFFFFFF, inst.typ)
+                if key in imm_regs and imm_regs[key] != inst.dest:
+                    # Replace with CPY to the existing register
+                    new_insts.append(MIRInstruction(
+                        "CPY", inst.typ, inst.dest, imm_regs[key], line=inst.line
+                    ))
+                    last_def[inst.dest] = (imm_regs[key], len(new_insts) - 1)
+                    removed += 1
+                    continue
+                imm_regs[key] = inst.dest
+
+            # ── Pattern 2: self-copy CPY ──
+            if inst.op == "CPY" and inst.dest and isinstance(inst.src1, str):
+                if inst.dest == inst.src1:
+                    removed += 1
+                    continue  # NOP, skip entirely
+
+            # ── Patterns 3-7: algebraic identities ──
+            if inst.op in ("ADD", "SUB") and inst.typ == "u32":
+                if isinstance(inst.src2, str):
+                    pass  # not a constant — can't simplify
+                elif (inst.op == "ADD" and inst.src2 == 0) or \
+                     (inst.op == "SUB" and inst.src2 == 0):
+                    if inst.dest and isinstance(inst.src1, str):
+                        new_insts.append(MIRInstruction(
+                            "CPY", inst.typ, inst.dest, inst.src1, line=inst.line
+                        ))
+                        last_def[inst.dest] = (inst.src1, len(new_insts) - 1)
+                        removed += 1
+                        continue
+            elif inst.op == "MUL" and inst.typ == "u32":
+                if isinstance(inst.src2, str):
+                    pass
+                elif inst.src2 == 1:
+                    if inst.dest and isinstance(inst.src1, str):
+                        new_insts.append(MIRInstruction(
+                            "CPY", inst.typ, inst.dest, inst.src1, line=inst.line
+                        ))
+                        last_def[inst.dest] = (inst.src1, len(new_insts) - 1)
+                        removed += 1
+                        continue
+                elif inst.src2 == 0:
+                    if inst.dest:
+                        new_insts.append(MIRInstruction(
+                            "LOADI", dest=inst.dest, imm=0, line=inst.line
+                        ))
+                        imm_regs[(0, inst.typ)] = inst.dest
+                        removed += 1
+                        continue
+            elif inst.op in ("SHL", "SHR") and inst.typ == "u32":
+                if not isinstance(inst.src2, str) and inst.src2 == 0:
+                    if inst.dest and isinstance(inst.src1, str):
+                        new_insts.append(MIRInstruction(
+                            "CPY", inst.typ, inst.dest, inst.src1, line=inst.line
+                        ))
+                        last_def[inst.dest] = (inst.src1, len(new_insts) - 1)
+                        removed += 1
+                        continue
+            elif inst.op in ("AND", "OR", "XOR"):
+                if isinstance(inst.src1, str) and isinstance(inst.src2, str) and inst.src1 == inst.src2:
+                    if inst.op in ("AND", "OR"):
+                        if inst.dest:
+                            new_insts.append(MIRInstruction(
+                                "CPY", inst.typ, inst.dest, inst.src1, line=inst.line
+                            ))
+                            last_def[inst.dest] = (inst.src1, len(new_insts) - 1)
+                            removed += 1
+                            continue
+
+            # ── Pattern 9: LOADI followed by CPY ──
+            if inst.op == "LOADI" and inst.dest and inst.imm is not None:
+                pass  # already handled by imm_regs tracking above
+
+            # ── Update tracking structures ──
+            # Invalidate imm_regs entries whose register was redefined
+            if inst.dest:
+                # Kill last_def for this dest (new definition invalidates old copy)
+                last_def.pop(inst.dest, None)
+                # Kill any imm_regs backed by the redefined register
+                imm_regs = {k: v for k, v in imm_regs.items() if v != inst.dest}
+                # Track CPY definitions for copy propagation
+                if inst.op == "CPY" and isinstance(inst.src1, str) and inst.dest != inst.src1:
+                    last_def[inst.dest] = (inst.src1, len(new_insts))
+                # Track LOADI for dedup
+                if inst.op == "LOADI" and inst.imm is not None:
+                    imm_regs[(inst.imm & 0xFFFFFFFF, inst.typ)] = inst.dest
+
+            new_insts.append(inst)
+
+        block.instructions = new_insts
+
+    return removed
+
+
 def interference_graph(program: MIRProgram, predicate: bool = False, excluded: Optional[Set[str]] = None) -> Dict[str, Set[str]]:
     excluded = excluded or set()
     _, live_out = block_liveness(program, predicate)
@@ -1315,6 +1454,59 @@ def allocate_registers(program: MIRProgram) -> Tuple[Dict[str, int], Dict[str, i
             used_components.update(inst.gpr_uses(program.pair_hi))
             used_components.update(inst.gpr_defs(program.pair_hi))
     graph = interference_graph(program)
+
+    # ── Conservative coalescing of CPY-related scalar registers ──
+    # Merge non-interfering copy pairs to eliminate CPY instructions.
+    # Only scalar (non-pair) copy pairs are considered.
+    # Build pair-component set first so we can exclude 64-bit pairs.
+    _pair_components: Set[str] = set()
+    for _base, (_lo, _hi) in program.pair_groups.items():
+        _pair_components.add(_lo)
+        _pair_components.add(_hi)
+
+    coalesced: Dict[str, str] = {}
+    # Collect MIR-level CPY pairs
+    copy_pairs: List[Tuple[str, str]] = []
+    for block in program.blocks:
+        for inst in block.instructions:
+            if inst.op == "CPY" and inst.dest and isinstance(inst.src1, str):
+                if inst.dest != inst.src1:
+                    copy_pairs.append((inst.src1, inst.dest))
+    # Deduplicate and apply Briggs test
+    seen_pairs: Set[Tuple[str, str]] = set()
+    for src, dst in copy_pairs:
+        if (src, dst) in seen_pairs or (dst, src) in seen_pairs:
+            continue
+        seen_pairs.add((src, dst))
+        if src not in graph or dst not in graph:
+            continue  # one side was already merged or is unused
+        # Don't coalesce across pair components
+        if src in _pair_components or dst in _pair_components:
+            continue
+        # Briggs test: merged node degree must be < 256 (trivially colorable)
+        merged_neighbors = (graph[src] | graph[dst]) - {src, dst}
+        if len(merged_neighbors) < 256:
+            # Merge src → dst
+            coalesced[src] = dst
+            graph[dst] = merged_neighbors
+            graph.pop(src, None)
+            for node in merged_neighbors:
+                if node in graph:
+                    graph[node].discard(src)
+                    graph[node].add(dst)
+            # Rewrite all MIR references from src to dst
+            for blk in program.blocks:
+                for inst in blk.instructions:
+                    if inst.dest == src:
+                        inst.dest = dst
+                    if inst.src1 == src:
+                        inst.src1 = dst
+                    if inst.src2 == src:
+                        inst.src2 = dst
+                    if inst.src3 == src:
+                        inst.src3 = dst
+        # else: not trivially colorable after merge — skip this pair
+
     active_pairs = {
         base: components
         for base, components in program.pair_groups.items()
@@ -1469,6 +1661,18 @@ def schedule_block(block: MIRBlock, pair_hi: Dict[str, str]) -> None:
 
 
 def encode_program(program: MIRProgram, gpr: Dict[str, int], preds: Dict[str, int]) -> Tuple[bytes, List[Dict[str, int]]]:
+    # Remove self-copy CPY instructions (dest == src1 after coalescing).
+    # These are NOPs and waste an instruction slot.
+    removed = 0
+    for block in program.blocks:
+        kept: List[MIRInstruction] = []
+        for inst in block.instructions:
+            if inst.op == "CPY" and inst.dest and isinstance(inst.src1, str) and inst.dest == inst.src1:
+                removed += 1
+                continue
+            kept.append(inst)
+        block.instructions = kept
+
     pc_by_block: Dict[str, int] = {}
     pc = 0
     for block in program.blocks:
@@ -1589,22 +1793,36 @@ def compile_source(source: str, input_name: str, output_name: str, opt_level: st
         "dce": 0,
         "licm": 0,
         "mir_dce": 0,
+        "mir_peephole": 0,
         "mad_fusion": 0,
         "address_induction": 0,
     }
     if opt_level == "O2":
         pass_stats["block_merging"] = merge_blocks(ptx)
-        pass_stats["constant_folding"] = fold_integer_constants(ptx)
         pass_stats["licm"] = licm(ptx)
         pass_stats["address_induction"] = strength_reduce_address_induction(ptx)
+
+        # Fixpoint: fold constants and eliminate dead code iteratively.
+        # Each round may expose new constant operands or dead instructions
+        # that enable further folding in the next round.
+        while True:
+            fc = fold_integer_constants(ptx)
+            dc = dce(ptx)
+            pass_stats["constant_folding"] += fc
+            pass_stats["dce"] += dc
+            if fc == 0 and dc == 0:
+                break
+
         pass_stats["cse"] = local_cse(ptx)
-        pass_stats["dce"] += dce(ptx)
+        pass_stats["dce"] += dce(ptx)       # CSE may create dead copies
         pass_stats["mad_fusion"] = fuse_mad(ptx)
-        pass_stats["dce"] += dce(ptx)
+        pass_stats["dce"] += dce(ptx)       # MAD fusion may make old mul/add dead
     lowerer = Lowerer(ptx)
     mir = lowerer.lower()
     if opt_level == "O2":
         pass_stats["mir_dce"] = mir_dce(mir)
+        pass_stats["mir_peephole"] = mir_peephole(mir)
+        pass_stats["mir_dce"] += mir_dce(mir)  # peephole may create dead code
         for block in mir.blocks:
             schedule_block(block, mir.pair_hi)
     spill_loads = spill_stores = spill_serial = 0
