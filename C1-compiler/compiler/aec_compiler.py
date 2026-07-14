@@ -1117,11 +1117,16 @@ def _clone_and_remap(inst: PTXInstruction, remap: Dict[str, str]) -> PTXInstruct
 
 
 def unroll_loops(program: PTXProgram, factor: int = 4) -> int:
-    """Unroll innermost loops whose induction step is a compile-time constant."""
+    """Unroll innermost loops whose induction step is a compile-time constant.
+
+    A remainder loop is generated so that trip counts that are not a multiple
+    of *factor* still produce correct results.
+    """
     if len(program.blocks) < 2:
         return 0
 
     unrolled = 0
+    _rem_suffix = 0
 
     for header in list(program.blocks):
         if not header.instructions:
@@ -1137,10 +1142,9 @@ def unroll_loops(program: PTXProgram, factor: int = 4) -> int:
             if target_name != header.name:
                 continue
             if latch is header:
-                continue  # self-loop, skip
+                continue
 
-            # latch branches back to header — we have a loop.
-            # Find induction: last ADD before the bra that self-increments.
+            # ── identify induction variable and step ──
             ind_var: Optional[str] = None
             step_val: Optional[int] = None
             for inst in reversed(latch.instructions[:-1]):
@@ -1150,63 +1154,132 @@ def unroll_loops(program: PTXProgram, factor: int = 4) -> int:
                         if is_register(b):
                             step_val = _find_constant_def(b, program)
                         else:
-                            try:
-                                step_val = parse_int(b)
-                            except CompileError:
-                                step_val = None
+                            try: step_val = parse_int(b)
+                            except CompileError: step_val = None
                         if step_val is not None:
                             ind_var = dst
                             break
-
             if ind_var is None or step_val is None:
                 continue
 
-            # Only unroll small bodies
-            body = latch.instructions[:-1]  # exclude final bra
+            body = latch.instructions[:-1]
             if len(body) > 20 or len(body) < 3:
                 continue
 
-            # Create unrolled body
-            new_body: List[PTXInstruction] = []
-            synthetic_id = 0
+            # ── find header's CMPP that guards the loop ──
+            hdr_cmp: Optional[PTXInstruction] = None
+            hdr_brx: Optional[PTXInstruction] = None
+            trip_reg: Optional[str] = None
+            cmp_op: Optional[str] = None   # e.g. "ge", "gt", …
+            for inst in header.instructions:
+                m = re.fullmatch(r"setp\.(eq|ne|lt|le|gt|ge)\.u32", inst.mnemonic)
+                if m and len(inst.operands) == 3:
+                    p, a, b = inst.operands[0], inst.operands[1], inst.operands[2]
+                    if (is_register(a) and a == ind_var and is_register(b)):
+                        hdr_cmp = inst; trip_reg = b; cmp_op = m.group(1)
+                        break
+                    if (is_register(b) and b == ind_var and is_register(a)):
+                        hdr_cmp = inst; trip_reg = a; cmp_op = m.group(1)
+                        break
+            if hdr_cmp is None or trip_reg is None:
+                continue
+            # Find the BRX that follows the CMPP (must use same predicate)
+            for inst in header.instructions:
+                if inst.mnemonic == "bra" and inst.guard and inst.guard == hdr_cmp.operands[0]:
+                    hdr_brx = inst
+                    break
+            if hdr_brx is None:
+                continue
+            exit_name = hdr_brx.operands[0]
 
-            def fresh(name: str) -> str:
-                nonlocal synthetic_id
+            # ── fresh-name helper ──
+            def _fresh(prefix: str) -> str:
+                nonlocal _rem_suffix
                 while True:
-                    r = f"%__u{synthetic_id}_{name}"
-                    synthetic_id += 1
-                    if r not in program.register_types:
-                        program.register_types[r] = "u32"
-                        return r
+                    name = f"%__unroll_{_rem_suffix}_{prefix}"
+                    _rem_suffix += 1
+                    if name not in program.register_types:
+                        program.register_types[name] = "u32"
+                        return name
 
-            # Copy 0: original body
-            new_body.extend(body)
+            # ── 1. Modify header: guard = ind + factor; CMPP guard vs trip ──
+            line = hdr_cmp.line
+            guard = _fresh("guard")
+            # Insert guard = ind + factor before the CMPP
+            idx = header.instructions.index(hdr_cmp)
+            header.instructions.insert(idx, PTXInstruction(
+                "add.u32", [guard, ind_var, str(factor)], line
+            ))
+            # Change CMPP: guard vs trip_reg, using "gt" (guard > trip → remain)
+            hdr_cmp.mnemonic = "setp.gt.u32"
+            # The guard replaces ind_var in the operand list
+            ops = hdr_cmp.operands
+            if ops[1] == ind_var:
+                ops[1] = guard
+            elif ops[2] == ind_var:
+                ops[2] = guard
 
-            # Copies 1..factor-1: offset induction by copy_idx * step
+            # ── 2. Create remainder block ──
+            rem_name = f"__remainder{unrolled}"
+            # Remainder header check: original CMPP(k, K), BRX exit
+            rem_cmp = PTXInstruction(
+                f"setp.{cmp_op}.u32",
+                [hdr_brx.guard, ind_var, trip_reg],
+                line
+            )
+            rem_brx = PTXInstruction("bra", [exit_name], line, hdr_brx.guard, hdr_brx.guard_neg)
+            # Remainder body: original latch body (1 copy) with step=1
+            rem_body: List[PTXInstruction] = [rem_cmp, rem_brx]
+            # Clone body instructions — they already include the induction
+            # increment, so we must NOT add a second one.
+            for inst in body:
+                rem_body.append(inst.clone())
+            rem_body.append(PTXInstruction("bra", [rem_name], line))
+
+            rem_block = PTXBlock(rem_name, instructions=rem_body, successors=[exit_name, rem_name])
+            rem_block.aliases.append(rem_name)
+
+            # Record rem_name as a valid branch target
+            # (the existing alias→block machinery in parse_ptx is post-hoc,
+            #  but successors are already set correctly here)
+
+            # ── 3. Point header BRX to remainder instead of exit ──
+            hdr_brx.operands[0] = rem_name
+            # Update header successors
+            if exit_name in header.successors:
+                header.successors[header.successors.index(exit_name)] = rem_name
+
+            # ── 4. Build unrolled latch body ──
+            new_body: List[PTXInstruction] = []
+            new_body.extend(body)  # copy 0
+
             for copy_idx in range(1, factor):
                 offset = copy_idx * step_val
-                ind_offset = fresh("k")
-                # %ind_offset = %ind + offset
+                ind_offset = _fresh("k")
                 new_body.append(PTXInstruction(
-                    "add.u32", [ind_offset, ind_var, str(offset)], latch.instructions[0].line
+                    "add.u32", [ind_offset, ind_var, str(offset)], line
                 ))
                 remap = {ind_var: ind_offset}
                 for inst in body:
                     new_body.append(_clone_and_remap(inst, remap))
 
-            # Fix induction increment: step → step * factor
+            # Fix induction increment: step → factor * step
             for inst in new_body:
                 if inst.mnemonic == "add.u32" and len(inst.operands) == 3:
                     if (inst.operands[0] == ind_var and inst.operands[1] == ind_var
                             and not is_register(inst.operands[2])):
-                        continue  # this is an offset ADD, not the induction
+                        continue
                     if inst.operands[0] == ind_var and inst.operands[1] == ind_var:
                         inst.operands[2] = str(factor * step_val)
                         break
 
-            # Add the final bra back
             new_body.append(tail)
             latch.instructions = new_body
+
+            # ── 5. Insert remainder block after latch ──
+            latch_idx = program.blocks.index(latch)
+            program.blocks.insert(latch_idx + 1, rem_block)
+
             unrolled += 1
 
     return unrolled
