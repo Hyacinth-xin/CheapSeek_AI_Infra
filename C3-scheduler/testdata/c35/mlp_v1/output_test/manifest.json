@@ -1,0 +1,13 @@
+{
+  "tensors": [
+    {
+      "name": "logits",
+      "file": "logits.npy",
+      "dtype": "float32",
+      "shape": [
+        10000,
+        10
+      ]
+    }
+  ]
+}

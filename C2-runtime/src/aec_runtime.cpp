@@ -328,7 +328,7 @@ const char *aecGetErrorName(aecError_t error) {
 // R102  Allocation / Free
 // =====================================================================
 aecError_t aecAlloc(aecDevicePtr *out_ptr, size_t bytes) {
-    if (!out_ptr) return finish(AEC_ERROR_INVALID_ARGUMENT);
+    if (!out_ptr || bytes == 0) return finish(AEC_ERROR_INVALID_ARGUMENT);
     aecDevicePtr ptr = 0;
     aecDeviceStatus st = aecDeviceAlloc(bytes, 64, &ptr);
     if (st != AEC_DEVICE_SUCCESS) return finish(device_status_to_error(st));
