@@ -605,36 +605,11 @@ def mov_mnemonic_for(inst: PTXInstruction) -> str:
     return "mov.b32"
 
 
-def _track_address_base(inst: PTXInstruction, address_base: Dict[str, str]) -> None:
-    """Track which pmem base register each address derives from for alias analysis."""
-    if inst.mnemonic == "ld.param.u64" and len(inst.operands) >= 1:
-        address_base[inst.operands[0]] = inst.operands[0]
-    elif inst.mnemonic in ("add.u64", "mov.u64", "mov.b64") and len(inst.operands) >= 2:
-        dest_reg = inst.operands[0]
-        src_reg = inst.operands[1]
-        base = address_base.get(src_reg) if is_register(src_reg) else None
-        if base:
-            address_base[dest_reg] = base
-
-
-def _addr_reg(operand: str, address_base: Dict[str, str]) -> Optional[str]:
-    """Resolve a memory operand to its canonical base register for alias checks."""
-    token = operand.strip()
-    if token.startswith("[") and token.endswith("]"):
-        token = token[1:-1].strip()
-    if is_register(token):
-        return address_base.get(token, token)
-    return None
-
-
 def local_cse(program: PTXProgram) -> int:
     optimized = 0
     for block in program.blocks:
         copies: Dict[str, str] = {}
         expressions: Dict[Tuple[object, ...], str] = {}
-        # Track which pmem base each address register derives from.
-        # Used for precise store->load invalidation.
-        address_base: Dict[str, str] = {}
         new_insts: List[PTXInstruction] = []
         for original in block.instructions:
             inst = original.clone()
@@ -659,24 +634,13 @@ def local_cse(program: PTXProgram) -> int:
                         expressions.pop(key, None)
 
             if inst.mnemonic.startswith("st."):
-                # Precisely invalidate only loads that may alias with this store.
-                store_addr_reg: Optional[str] = None
-                if len(inst.operands) >= 1:
-                    store_addr_reg = _addr_reg(inst.operands[0], address_base)
-                if store_addr_reg:
-                    expressions = {
-                        key: value for key, value in expressions.items()
-                        if not (
-                            str(key[0]).startswith("ld.global")
-                            and _addr_reg(str(key[1]) if len(key) > 1 else "", address_base) == store_addr_reg
-                        )
-                    }
-                else:
-                    expressions = {key: value for key, value in expressions.items()
-                                   if not str(key[0]).startswith("ld.global")}
-
-            # Track address bases for precise alias analysis
-            _track_address_base(inst, address_base)
+                # PTX parameters do not carry a noalias guarantee.  Any global
+                # store can therefore invalidate a load through another pointer.
+                expressions = {
+                    key: value
+                    for key, value in expressions.items()
+                    if not str(key[0]).startswith("ld.global")
+                }
 
             cse_eligible = (
                 dest is not None
@@ -912,6 +876,46 @@ def fold_integer_constants(program: PTXProgram) -> int:
                 if a is not None and b is not None:
                     value = binary[inst.mnemonic](a, b) & 0xFFFFFFFF
                     replacement = PTXInstruction("mov.u32", [inst.operands[0], str(value)], inst.line)
+                elif inst.mnemonic == "add.u32":
+                    if a == 0:
+                        replacement = PTXInstruction("mov.u32", [inst.operands[0], inst.operands[2]], inst.line)
+                    elif b == 0:
+                        replacement = PTXInstruction("mov.u32", [inst.operands[0], inst.operands[1]], inst.line)
+                elif inst.mnemonic == "sub.u32":
+                    if inst.operands[1] == inst.operands[2]:
+                        replacement = PTXInstruction("mov.u32", [inst.operands[0], "0"], inst.line)
+                    elif b == 0:
+                        replacement = PTXInstruction("mov.u32", [inst.operands[0], inst.operands[1]], inst.line)
+                elif inst.mnemonic == "mul.lo.u32":
+                    if a == 0 or b == 0:
+                        replacement = PTXInstruction("mov.u32", [inst.operands[0], "0"], inst.line)
+                    elif a == 1:
+                        replacement = PTXInstruction("mov.u32", [inst.operands[0], inst.operands[2]], inst.line)
+                    elif b == 1:
+                        replacement = PTXInstruction("mov.u32", [inst.operands[0], inst.operands[1]], inst.line)
+                elif inst.mnemonic in {"and.b32", "or.b32", "xor.b32"}:
+                    left, right = inst.operands[1], inst.operands[2]
+                    if inst.mnemonic == "and.b32":
+                        if a == 0 or b == 0:
+                            replacement = PTXInstruction("mov.b32", [inst.operands[0], "0"], inst.line)
+                        elif a == 0xFFFFFFFF:
+                            replacement = PTXInstruction("mov.b32", [inst.operands[0], right], inst.line)
+                        elif b == 0xFFFFFFFF or left == right:
+                            replacement = PTXInstruction("mov.b32", [inst.operands[0], left], inst.line)
+                    elif inst.mnemonic == "or.b32":
+                        if a == 0:
+                            replacement = PTXInstruction("mov.b32", [inst.operands[0], right], inst.line)
+                        elif b == 0 or left == right:
+                            replacement = PTXInstruction("mov.b32", [inst.operands[0], left], inst.line)
+                    elif left == right:
+                        replacement = PTXInstruction("mov.b32", [inst.operands[0], "0"], inst.line)
+                    elif a == 0:
+                        replacement = PTXInstruction("mov.b32", [inst.operands[0], right], inst.line)
+                    elif b == 0:
+                        replacement = PTXInstruction("mov.b32", [inst.operands[0], left], inst.line)
+                elif inst.mnemonic in {"shl.b32", "shr.u32"} and b is not None and (b & 31) == 0:
+                    mov = "mov.b32" if inst.mnemonic == "shl.b32" else "mov.u32"
+                    replacement = PTXInstruction(mov, [inst.operands[0], inst.operands[1]], inst.line)
             elif inst.mnemonic == "mad.lo.u32" and len(inst.operands) == 4:
                 values = [value_of(token) for token in inst.operands[1:]]
                 if all(value is not None for value in values):
@@ -1439,6 +1443,19 @@ class Lowerer:
             block.instructions.append(MIRInstruction("HALT", line=line))
             return
         raise CompileError(f"lowering not implemented for '{m}'", line)
+
+
+def remove_fallthrough_branches(program: MIRProgram) -> int:
+    """Remove unconditional branches whose target is the next encoded block."""
+    removed = 0
+    for index, block in enumerate(program.blocks[:-1]):
+        if not block.instructions:
+            continue
+        tail = block.instructions[-1]
+        if tail.op == "BR" and tail.target == program.blocks[index + 1].name:
+            block.instructions.pop()
+            removed += 1
+    return removed
 
 
 def block_liveness(program: MIRProgram, predicate: bool = False) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
@@ -2043,6 +2060,7 @@ def compile_source(source: str, input_name: str, output_name: str, opt_level: st
         "dce": 0,
         "licm": 0,
         "loop_unroll": 0,
+        "fallthrough_branches": 0,
         "mir_dce": 0,
         "mir_peephole": 0,
         "mad_fusion": 0,
@@ -2072,6 +2090,7 @@ def compile_source(source: str, input_name: str, output_name: str, opt_level: st
     lowerer = Lowerer(ptx)
     mir = lowerer.lower()
     if opt_level == "O2":
+        pass_stats["fallthrough_branches"] = remove_fallthrough_branches(mir)
         pass_stats["mir_dce"] = mir_dce(mir)
         pass_stats["mir_peephole"] = mir_peephole(mir)
         pass_stats["mir_dce"] += mir_dce(mir)  # peephole may create dead code
