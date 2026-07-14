@@ -605,11 +605,36 @@ def mov_mnemonic_for(inst: PTXInstruction) -> str:
     return "mov.b32"
 
 
+def _track_address_base(inst: PTXInstruction, address_base: Dict[str, str]) -> None:
+    """Track which pmem base register each address derives from for alias analysis."""
+    if inst.mnemonic == "ld.param.u64" and len(inst.operands) >= 1:
+        address_base[inst.operands[0]] = inst.operands[0]
+    elif inst.mnemonic in ("add.u64", "mov.u64", "mov.b64") and len(inst.operands) >= 2:
+        dest_reg = inst.operands[0]
+        src_reg = inst.operands[1]
+        base = address_base.get(src_reg) if is_register(src_reg) else None
+        if base:
+            address_base[dest_reg] = base
+
+
+def _addr_reg(operand: str, address_base: Dict[str, str]) -> Optional[str]:
+    """Resolve a memory operand to its canonical base register for alias checks."""
+    token = operand.strip()
+    if token.startswith("[") and token.endswith("]"):
+        token = token[1:-1].strip()
+    if is_register(token):
+        return address_base.get(token, token)
+    return None
+
+
 def local_cse(program: PTXProgram) -> int:
     optimized = 0
     for block in program.blocks:
         copies: Dict[str, str] = {}
         expressions: Dict[Tuple[object, ...], str] = {}
+        # Track which pmem base each address register derives from.
+        # Used for precise store->load invalidation.
+        address_base: Dict[str, str] = {}
         new_insts: List[PTXInstruction] = []
         for original in block.instructions:
             inst = original.clone()
@@ -634,7 +659,24 @@ def local_cse(program: PTXProgram) -> int:
                         expressions.pop(key, None)
 
             if inst.mnemonic.startswith("st."):
-                expressions = {key: value for key, value in expressions.items() if not str(key[0]).startswith("ld.global")}
+                # Precisely invalidate only loads that may alias with this store.
+                store_addr_reg: Optional[str] = None
+                if len(inst.operands) >= 1:
+                    store_addr_reg = _addr_reg(inst.operands[0], address_base)
+                if store_addr_reg:
+                    expressions = {
+                        key: value for key, value in expressions.items()
+                        if not (
+                            str(key[0]).startswith("ld.global")
+                            and _addr_reg(str(key[1]) if len(key) > 1 else "", address_base) == store_addr_reg
+                        )
+                    }
+                else:
+                    expressions = {key: value for key, value in expressions.items()
+                                   if not str(key[0]).startswith("ld.global")}
+
+            # Track address bases for precise alias analysis
+            _track_address_base(inst, address_base)
 
             cse_eligible = (
                 dest is not None
@@ -1045,6 +1087,129 @@ def strength_reduce_address_induction(program: PTXProgram) -> int:
         body.instructions[increment_index:increment_index] = advances
         transformed += 1
     return transformed
+
+
+def _find_constant_def(reg: str, program: PTXProgram) -> Optional[int]:
+    """Look up the constant value of a register if defined via mov.u32 imm."""
+    for block in program.blocks:
+        for inst in block.instructions:
+            defs, _ = instruction_defs_uses(inst)
+            if reg in defs and inst.mnemonic in ("mov.u32", "mov.b32"):
+                if len(inst.operands) == 2 and not is_register(inst.operands[1]):
+                    try:
+                        return parse_int(inst.operands[1])
+                    except CompileError:
+                        return None
+    return None
+
+
+def _clone_and_remap(inst: PTXInstruction, remap: Dict[str, str]) -> PTXInstruction:
+    """Clone a PTX instruction, remapping operand registers."""
+    cloned = inst.clone()
+    for i in range(len(cloned.operands)):
+        token = cloned.operands[i].strip()
+        bracketed = token.startswith("[") and token.endswith("]")
+        inner = token[1:-1].strip() if bracketed else token
+        if inner in remap:
+            new_inner = remap[inner]
+            cloned.operands[i] = f"[{new_inner}]" if bracketed else new_inner
+    return cloned
+
+
+def unroll_loops(program: PTXProgram, factor: int = 4) -> int:
+    """Unroll innermost loops whose induction step is a compile-time constant."""
+    if len(program.blocks) < 2:
+        return 0
+
+    unrolled = 0
+
+    for header in list(program.blocks):
+        if not header.instructions:
+            continue
+        # Find back edges: block L that branches to H
+        for latch in list(program.blocks):
+            if not latch.instructions:
+                continue
+            tail = latch.instructions[-1]
+            if tail.mnemonic != "bra" or tail.guard:
+                continue
+            target_name = tail.operands[0]
+            if target_name != header.name:
+                continue
+            if latch is header:
+                continue  # self-loop, skip
+
+            # latch branches back to header — we have a loop.
+            # Find induction: last ADD before the bra that self-increments.
+            ind_var: Optional[str] = None
+            step_val: Optional[int] = None
+            for inst in reversed(latch.instructions[:-1]):
+                if inst.mnemonic == "add.u32" and len(inst.operands) == 3:
+                    dst, a, b = inst.operands[0], inst.operands[1], inst.operands[2]
+                    if dst == a and is_register(dst):
+                        if is_register(b):
+                            step_val = _find_constant_def(b, program)
+                        else:
+                            try:
+                                step_val = parse_int(b)
+                            except CompileError:
+                                step_val = None
+                        if step_val is not None:
+                            ind_var = dst
+                            break
+
+            if ind_var is None or step_val is None:
+                continue
+
+            # Only unroll small bodies
+            body = latch.instructions[:-1]  # exclude final bra
+            if len(body) > 20 or len(body) < 3:
+                continue
+
+            # Create unrolled body
+            new_body: List[PTXInstruction] = []
+            synthetic_id = 0
+
+            def fresh(name: str) -> str:
+                nonlocal synthetic_id
+                while True:
+                    r = f"%__u{synthetic_id}_{name}"
+                    synthetic_id += 1
+                    if r not in program.register_types:
+                        program.register_types[r] = "u32"
+                        return r
+
+            # Copy 0: original body
+            new_body.extend(body)
+
+            # Copies 1..factor-1: offset induction by copy_idx * step
+            for copy_idx in range(1, factor):
+                offset = copy_idx * step_val
+                ind_offset = fresh("k")
+                # %ind_offset = %ind + offset
+                new_body.append(PTXInstruction(
+                    "add.u32", [ind_offset, ind_var, str(offset)], latch.instructions[0].line
+                ))
+                remap = {ind_var: ind_offset}
+                for inst in body:
+                    new_body.append(_clone_and_remap(inst, remap))
+
+            # Fix induction increment: step → step * factor
+            for inst in new_body:
+                if inst.mnemonic == "add.u32" and len(inst.operands) == 3:
+                    if (inst.operands[0] == ind_var and inst.operands[1] == ind_var
+                            and not is_register(inst.operands[2])):
+                        continue  # this is an offset ADD, not the induction
+                    if inst.operands[0] == ind_var and inst.operands[1] == ind_var:
+                        inst.operands[2] = str(factor * step_val)
+                        break
+
+            # Add the final bra back
+            new_body.append(tail)
+            latch.instructions = new_body
+            unrolled += 1
+
+    return unrolled
 
 
 class Lowerer:
@@ -1804,6 +1969,7 @@ def compile_source(source: str, input_name: str, output_name: str, opt_level: st
         "cse": 0,
         "dce": 0,
         "licm": 0,
+        "loop_unroll": 0,
         "mir_dce": 0,
         "mir_peephole": 0,
         "mad_fusion": 0,
@@ -1813,6 +1979,7 @@ def compile_source(source: str, input_name: str, output_name: str, opt_level: st
         pass_stats["block_merging"] = merge_blocks(ptx)
         pass_stats["licm"] = licm(ptx)
         pass_stats["address_induction"] = strength_reduce_address_induction(ptx)
+        pass_stats["loop_unroll"] = unroll_loops(ptx)
 
         # Fixpoint: fold constants and eliminate dead code iteratively.
         # Each round may expose new constant operands or dead instructions
