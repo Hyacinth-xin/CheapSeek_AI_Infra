@@ -310,6 +310,37 @@ class ONNXExecutor:
                 outputs[name] = tensors[name].astype(xp.float32)
         return outputs
 
+    def predict(self, input_dir, batch_size=None):
+        """分批推理，返回拼接好的 host numpy dict（不写盘）。
+
+        batch_size=None 表示全量。显存不足时用 batch_size=256 分批。
+        """
+        if self.model is None:
+            self._parse_model()
+
+        from .data_loader import load_input
+
+        inputs = load_input(input_dir)
+        first_key = list(inputs.keys())[0]
+        total = inputs[first_key].shape[0]
+
+        if batch_size is None or batch_size >= total:
+            outputs = self._run_graph(inputs)
+            return {name: as_host(arr) for name, arr in outputs.items()}
+
+        all_outputs = None
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            batch = {name: arr[start:end] for name, arr in inputs.items()}
+            outputs = self._run_graph(batch)
+            if all_outputs is None:
+                all_outputs = {name: [] for name in outputs}
+            for name, arr in outputs.items():
+                all_outputs[name].append(as_host(arr))
+
+        return {name: np.concatenate(arrs, axis=0).astype(np.float32)
+                for name, arrs in all_outputs.items()}
+
     def run(self, input_dir, output_dir):
         if self.model is None:
             self._parse_model()

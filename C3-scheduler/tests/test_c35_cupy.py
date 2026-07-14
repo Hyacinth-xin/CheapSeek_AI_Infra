@@ -12,9 +12,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
-from src.backend import is_gpu, backend_name, as_host
+from src.backend import is_gpu, backend_name
 from src.executor import InferenceExecutor
-from src.data_loader import load_input, load_golden
+from src.data_loader import load_golden
 
 print(f"=== Backend: {backend_name()} | is_gpu={is_gpu()} ===\n")
 
@@ -29,10 +29,10 @@ for name, thr in MODELS:
     t0 = time.time()
     ex = InferenceExecutor(f"models/{name}.onnx")
     ex._parse_model()
-    out = ex._run_graph(load_input(f"testdata/c35/{name}/input"))
+    out = ex.predict(f"testdata/c35/{name}/input", batch_size=256)
     elapsed = time.time() - t0
 
-    logits = as_host(out["logits"])
+    logits = out["logits"]
     golden = load_golden(f"testdata/c35/{name}/golden")["logits"]
     max_diff = float(np.max(np.abs(logits - golden)))
     precision_ok = np.allclose(logits, golden, rtol=1e-3, atol=1e-3)
