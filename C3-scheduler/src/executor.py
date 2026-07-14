@@ -199,6 +199,9 @@ class ONNXExecutor:
         elif op_type == "GlobalAveragePool":
             x = inputs[0]
             result = xp.mean(x, axis=(2, 3))
+        elif op_type == "Identity":
+            # BigFormer: 直通复制，output = input
+            result = inputs[0]
         else:
             raise NotImplementedError(f"Unsupported operator: {op_type}")
 
