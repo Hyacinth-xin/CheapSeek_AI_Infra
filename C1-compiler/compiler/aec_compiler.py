@@ -1113,7 +1113,7 @@ class Lowerer:
             "and.b32": ("AND", "b32", 2),
             "or.b32": ("OR", "b32", 2),
             "xor.b32": ("XOR", "b32", 2),
-            "shl.b32": ("SHL", "b32", 2),
+            "shl.b32": ("SHL", "u32", 2),
             "shr.u32": ("SHR", "u32", 2),
             "add.f32": ("ADD", "f32", 2),
             "add.rn.f32": ("ADD", "f32", 2),
